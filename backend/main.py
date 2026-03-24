@@ -1059,6 +1059,18 @@ TOC_SECTION_STOP_MARKERS = {
     "list of dates and events",
     "dates and events",
 }
+TOC_INDEX_SECTION_MARKERS = {
+    "part a",
+    "index",
+    "part a - index",
+    "part-a",
+}
+TOC_INDEX_SECTION_STOP_MARKERS = {
+    "part b",
+    "chronology of events",
+    "part b - chronology of events",
+    "part-b",
+}
 TOC_NOISE_MARKERS = {
     "petitioner",
     "respondent",
@@ -1085,6 +1097,32 @@ def is_toc_stop_line(line: str) -> bool:
     if not lower or re.search(r"\d", lower):
         return False
     return lower in TOC_SECTION_STOP_MARKERS
+
+
+def isolate_toc_text_block(text: str) -> str:
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+    if not lines:
+        return ""
+
+    start_idx = 0
+    for idx, line in enumerate(lines):
+        lower = line.strip().lower()
+        if any(marker in lower for marker in TOC_INDEX_SECTION_MARKERS):
+            start_idx = idx
+            break
+
+    selected = []
+    seen_index_signal = False
+    for line in lines[start_idx:]:
+        lower = line.strip().lower()
+        if any(marker in lower for marker in TOC_INDEX_SECTION_MARKERS):
+            seen_index_signal = True
+        if seen_index_signal and any(marker in lower for marker in TOC_INDEX_SECTION_STOP_MARKERS):
+            break
+        selected.append(line)
+
+    block = "\n".join(selected).strip()
+    return block or normalize_ocr_text(text)
 
 
 def clean_toc_title(title: str) -> str:
@@ -1137,6 +1175,10 @@ def evaluate_toc_items_confidence(items: list[dict], max_page_hint: int) -> dict
     kept_items = len(cleaned_items)
     ascending_ratio = ascending_hits / max(kept_items, 1)
     coverage_ratio = kept_items / max(total_items, 1)
+    has_meaningful_page_span = any(
+        item["pageTo"] > item["pageFrom"] or item["pageFrom"] >= 2
+        for item in cleaned_items
+    )
     accepted = (
         kept_items >= 3
         and coverage_ratio >= 0.6
@@ -1145,6 +1187,10 @@ def evaluate_toc_items_confidence(items: list[dict], max_page_hint: int) -> dict
         kept_items == 2
         and total_items == 2
         and ascending_ratio >= 1.0
+    ) or (
+        kept_items >= 4
+        and ascending_ratio >= 1.0
+        and has_meaningful_page_span
     )
     return {
         "accepted": accepted,
@@ -2141,6 +2187,7 @@ async def generate_index(req: IndexRequest):
             page_num = page["page_num"]
             direct_text = direct_text_map.get(page_num, "")
             selected_text = page.get("text", "") or direct_text
+            toc_block_text = isolate_toc_text_block(selected_text)
             used_ocr_for_toc = page.get("used_ocr", False) or needs_ocr(direct_text)
             result["page_nums"].append(page_num)
             if used_ocr_for_toc:
@@ -2149,7 +2196,8 @@ async def generate_index(req: IndexRequest):
             else:
                 result["skipped_pages"].append(page_num)
             debug_dump(f"TOC direct text page {page_num}", direct_text)
-            filtered_lines.extend(filter_toc_lines(selected_text, toc_markers))
+            debug_dump(f"TOC isolated block page {page_num}", toc_block_text)
+            filtered_lines.extend(filter_toc_lines(toc_block_text, toc_markers))
 
         deduped_lines = []
         seen_lines = set()
