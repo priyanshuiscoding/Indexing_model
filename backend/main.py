@@ -2118,14 +2118,14 @@ Filtered lines:
 
 Return only valid JSON:
 [
-  {
+  {{
     "serialNo": "1",
     "title": "exact original text as found",
     "pageFrom": 1,
     "pageTo": 4,
     "courtFee": "",
     "source": "toc"
-  }
+  }}
 ]"""
             debug_dump("TOC raw prompt", toc_prompt)
             toc_llm_calls += 1
