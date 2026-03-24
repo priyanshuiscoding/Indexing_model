@@ -970,25 +970,136 @@ def is_toc_header_line(line: str, toc_markers: list[str]) -> bool:
     )
 
 
+TOC_SECTION_STOP_MARKERS = {
+    "chronology of events",
+    "list of dates and events",
+    "dates and events",
+}
+TOC_NOISE_MARKERS = {
+    "petitioner",
+    "respondent",
+    "versus",
+    "appellant",
+    "non-applicant",
+    "high court of",
+    "principal seat",
+    "miscellaneous petition no",
+    "miscellaneous petition",
+    "case no",
+    "advocate",
+    "through",
+}
+
+
+def is_toc_noise_line(line: str) -> bool:
+    lower = (line or "").lower()
+    return any(marker in lower for marker in TOC_NOISE_MARKERS)
+
+
+def is_toc_stop_line(line: str) -> bool:
+    lower = (line or "").strip().lower()
+    if not lower or re.search(r"\d", lower):
+        return False
+    return lower in TOC_SECTION_STOP_MARKERS
+
+
+def clean_toc_title(title: str) -> str:
+    cleaned = normalize_page_digits(re.sub(r"\s+", " ", title or "")).strip(" .:-|\t")
+    cleaned = re.sub(r"\b(?:annexure|sheet\s*count|court\s*fee)\b.*$", "", cleaned, flags=re.IGNORECASE).strip(" .:-|\t")
+    return cleaned
+
+
+def evaluate_toc_items_confidence(items: list[dict], max_page_hint: int) -> dict:
+    cleaned_items = []
+    rejected_titles = []
+    previous_page = 0
+    ascending_hits = 0
+
+    for item in items:
+        title = clean_toc_title(item.get("title", ""))
+        lower = title.lower()
+        page_from = coerce_page_number(item.get("pageFrom"), 0)
+        page_to = coerce_page_number(item.get("pageTo"), page_from)
+        is_noise = (
+            len(title) < 4
+            or len(title) > 180
+            or is_toc_noise_line(title)
+            or lower in TOC_SECTION_STOP_MARKERS
+            or title.count(":") >= 2
+            or bool(re.search(r"\b(?:s\.?\s*no|serial\s*no|page\s*no|pages?|particulars?|annexure|sheet)\b", lower, flags=re.IGNORECASE))
+            or page_from < 1
+            or page_to < page_from
+            or page_from > max_page_hint
+            or page_to > max_page_hint
+        )
+        if is_noise:
+            rejected_titles.append(title)
+            continue
+
+        cleaned = {
+            **item,
+            "title": title,
+            "displayTitle": clean_toc_title(item.get("displayTitle") or title),
+            "originalTitle": clean_toc_title(item.get("originalTitle") or title),
+            "pageFrom": page_from,
+            "pageTo": page_to,
+        }
+        if cleaned["pageFrom"] >= previous_page:
+            ascending_hits += 1
+            previous_page = cleaned["pageFrom"]
+        cleaned_items.append(cleaned)
+
+    total_items = len(items)
+    kept_items = len(cleaned_items)
+    ascending_ratio = ascending_hits / max(kept_items, 1)
+    coverage_ratio = kept_items / max(total_items, 1)
+    accepted = (
+        kept_items >= 3
+        and coverage_ratio >= 0.6
+        and ascending_ratio >= 0.66
+    ) or (
+        kept_items == 2
+        and total_items == 2
+        and ascending_ratio >= 1.0
+    )
+    return {
+        "accepted": accepted,
+        "items": cleaned_items,
+        "kept_items": kept_items,
+        "total_items": total_items,
+        "coverage_ratio": coverage_ratio,
+        "ascending_ratio": ascending_ratio,
+        "rejected_titles": rejected_titles[:8],
+    }
+
+
 def filter_toc_lines(text: str, toc_markers: list[str]) -> list[str]:
     filtered = []
     previous_was_row = False
+    seen_table_header = False
+    range_sep = r"[\-\u2013\u2014]"
     for raw_line in (text or "").splitlines():
         line = normalize_page_digits(re.sub(r"\s+", " ", raw_line)).strip(" |\t")
         if len(line) < 2:
+            previous_was_row = False
+            continue
+        if is_toc_stop_line(line):
+            break
+        if is_toc_noise_line(line) and not re.search(r"\d", line):
             previous_was_row = False
             continue
 
         keep = False
         if is_toc_header_line(line, toc_markers):
             keep = True
-        elif re.match(r"^\d{1,3}[\)\.\-: ]+.+?(?:\.{2,}\s*)?\d{1,4}(?:\s*[\-\u2013\u2014]\s*\d{1,4})?\s*$", line):
+            seen_table_header = True
+        elif re.match(rf"^\d{{1,3}}[\)\.\-: ]+.+?(?:\.{{2,}}\s*)?\d{{1,4}}(?:\s*{range_sep}\s*\d{{1,4}})?\s*$", line):
             keep = True
-        elif re.search(r"\.{2,}\s*\d{1,4}(?:\s*[\-\u2013\u2014]\s*\d{1,4})?\s*$", line):
+        elif re.search(rf"\.{{2,}}\s*\d{{1,4}}(?:\s*{range_sep}\s*\d{{1,4}})?\s*$", line):
             keep = True
-        elif re.search(r"\b\d{1,4}\s*[\-\u2013\u2014]\s*\d{1,4}\b", line):
-            keep = True
-        elif previous_was_row and len(line) <= 180 and not is_toc_header_line(line, toc_markers):
+        elif re.search(rf"\b\d{{1,4}}\s*{range_sep}\s*\d{{1,4}}\b", line):
+            keep = seen_table_header or not is_toc_noise_line(line)
+        elif previous_was_row and len(line) <= 160 and not is_toc_header_line(line, toc_markers) and not is_toc_noise_line(line):
             keep = True
 
         if keep:
@@ -1930,6 +2041,8 @@ async def generate_index(req: IndexRequest):
             "rule_items": [],
             "text_items": [],
             "image_items": [],
+            "accepted_items": [],
+            "accepted_source": "",
             "candidate_line_count": 0,
             "ocr_pages": [],
             "skipped_pages": [],
@@ -1944,7 +2057,7 @@ async def generate_index(req: IndexRequest):
             page_num = page["page_num"]
             direct_text = direct_text_map.get(page_num, "")
             selected_text = page.get("text", "") or direct_text
-            used_ocr_for_toc = needs_ocr(direct_text)
+            used_ocr_for_toc = page.get("used_ocr", False) or needs_ocr(direct_text)
             result["page_nums"].append(page_num)
             if used_ocr_for_toc:
                 result["ocr_pages"].append(page_num)
@@ -1972,8 +2085,21 @@ async def generate_index(req: IndexRequest):
         result["rule_items"] = parse_rule_based_toc_items(filtered_lines, default_source="toc")
         if result["rule_items"]:
             log.info("Rule-based TOC parsing found %s rows from pages %s", len(result["rule_items"]), result["page_nums"])
+            rule_quality = evaluate_toc_items_confidence(result["rule_items"], toc_range_end)
+            log.info(
+                "TOC rule quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s",
+                req.pdf_id,
+                rule_quality["kept_items"],
+                rule_quality["total_items"],
+                rule_quality["coverage_ratio"],
+                rule_quality["ascending_ratio"],
+                rule_quality["rejected_titles"],
+            )
+            if rule_quality["accepted"]:
+                result["accepted_items"] = rule_quality["items"]
+                result["accepted_source"] = "toc"
 
-        if allow_text_llm and filtered_lines and len(result["rule_items"]) < 2:
+        if allow_text_llm and not result["accepted_items"] and filtered_lines:
             toc_prompt = f"""You are reading filtered TOC candidate lines from an Indian court document.
 These lines may come from a real Table of Contents / Index spanning multiple pages.
 
@@ -2013,14 +2139,39 @@ Return only valid JSON:
                 row.setdefault("source", "toc")
             if result["text_items"]:
                 log.info("Merged TOC LLM call found %s rows from pages %s", len(result["text_items"]), result["page_nums"])
+                text_quality = evaluate_toc_items_confidence(result["text_items"], toc_range_end)
+                log.info(
+                    "TOC text quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s",
+                    req.pdf_id,
+                    text_quality["kept_items"],
+                    text_quality["total_items"],
+                    text_quality["coverage_ratio"],
+                    text_quality["ascending_ratio"],
+                    text_quality["rejected_titles"],
+                )
+                if text_quality["accepted"]:
+                    result["accepted_items"] = text_quality["items"]
+                    result["accepted_source"] = "toc"
             elif toc_raw.strip():
                 log.info("TOC text response for pages %s was not usable JSON (%s chars)", result["page_nums"], len(toc_raw))
 
-        combined_before_image = combine_toc_items(result["rule_items"], result["text_items"])
-        if not combined_before_image and allow_image_fallback:
+        if not result["accepted_items"] and allow_image_fallback:
             result["image_items"] = extract_toc_from_page_images(pdf_path, result["page_nums"])
             if result["image_items"]:
                 log.info("TOC image fallback found %s rows from pages %s", len(result["image_items"]), result["page_nums"])
+                image_quality = evaluate_toc_items_confidence(result["image_items"], toc_range_end)
+                log.info(
+                    "TOC image quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s",
+                    req.pdf_id,
+                    image_quality["kept_items"],
+                    image_quality["total_items"],
+                    image_quality["coverage_ratio"],
+                    image_quality["ascending_ratio"],
+                    image_quality["rejected_titles"],
+                )
+                if image_quality["accepted"]:
+                    result["accepted_items"] = image_quality["items"]
+                    result["accepted_source"] = "toc-image"
 
         return result
 
@@ -2063,7 +2214,8 @@ Return only valid JSON:
         toc_rule_items = first_pass["rule_items"]
         toc_text_items = first_pass["text_items"]
         toc_image_items = first_pass["image_items"]
-        combined_toc_items = combine_toc_items(toc_rule_items, toc_text_items, toc_image_items)
+        combined_toc_items = first_pass["accepted_items"]
+        toc_source = first_pass["accepted_source"]
         candidate_line_count = first_pass["candidate_line_count"]
 
         image_fallback_pages = []
@@ -2079,12 +2231,13 @@ Return only valid JSON:
             toc_rule_items = image_pass["rule_items"]
             toc_text_items = image_pass["text_items"]
             toc_image_items = image_pass["image_items"]
-            combined_toc_items = combine_toc_items(toc_rule_items, toc_text_items, toc_image_items)
+            combined_toc_items = image_pass["accepted_items"]
+            toc_source = image_pass["accepted_source"] or toc_source
             candidate_line_count = image_pass["candidate_line_count"]
 
         if combined_toc_items:
             index_items = build_toc_ranges_from_items(combined_toc_items, indexed_start, toc_range_end, "toc")
-            toc_source = "toc-image" if toc_image_items and not (toc_rule_items or toc_text_items) else "toc"
+            toc_source = toc_source or ("toc-image" if toc_image_items and not (toc_rule_items or toc_text_items) else "toc")
             log.info("TOC merged across pages %s into %s unique rows", toc_page_nums, len(index_items))
             debug_dump("TOC final rows", index_items)
 
