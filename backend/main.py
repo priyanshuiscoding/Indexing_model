@@ -1190,6 +1190,23 @@ def has_explicit_toc_signal(text: str, features: dict) -> bool:
     )
 
 
+def toc_acceptance_floor(quality: dict, candidate_pages: list[dict]) -> bool:
+    kept = int(quality.get("kept_items") or 0)
+    ascending = float(quality.get("ascending_ratio") or 0.0)
+    coverage = float(quality.get("coverage_ratio") or 0.0)
+    explicit_pages = sum(1 for page in candidate_pages if page.get("explicit"))
+    strong_explicit = any(
+        page.get("explicit") and page.get("features", {}).get("header_hits", 0) >= 1 and page.get("features", {}).get("numbered_row_lines", 0) >= 2
+        for page in candidate_pages
+    )
+
+    if kept >= 3 and ascending >= 0.66 and coverage >= 0.5:
+        return True
+    if kept >= 2 and explicit_pages >= 1 and ascending >= 1.0 and strong_explicit:
+        return True
+    return False
+
+
 def rank_toc_candidate_pages(candidate_pages: list[dict], toc_markers: list[str]) -> list[dict]:
     ranked = []
     for page in candidate_pages:
@@ -1209,33 +1226,23 @@ def select_toc_pages_for_extraction(ranked_pages: list[dict], max_pages: int = 3
     if not ranked_pages:
         return []
 
-    pages_by_num = sorted(ranked_pages, key=lambda item: item["page"]["page_num"])
-    best_window = []
-    best_key = None
+    ranked_by_priority = sorted(
+        ranked_pages,
+        key=lambda item: (-int(bool(item.get("explicit"))), -item["score"], item["page"]["page_num"])
+    )
+    best_anchor = ranked_by_priority[0]
+    anchor_page_num = best_anchor["page"]["page_num"]
 
-    for start_idx in range(len(pages_by_num)):
-        window = [pages_by_num[start_idx]]
-        for next_idx in range(start_idx + 1, len(pages_by_num)):
-            previous_page_num = window[-1]["page"]["page_num"]
-            current_page_num = pages_by_num[next_idx]["page"]["page_num"]
-            if current_page_num != previous_page_num + 1:
-                break
-            window.append(pages_by_num[next_idx])
-            if len(window) >= max_pages:
-                break
+    contiguous = [best_anchor]
+    next_page_num = anchor_page_num + 1
+    while len(contiguous) < max_pages:
+        match = next((item for item in ranked_pages if item["page"]["page_num"] == next_page_num), None)
+        if not match:
+            break
+        contiguous.append(match)
+        next_page_num += 1
 
-        candidate_windows = [window[:size] for size in range(1, len(window) + 1)]
-        for candidate in candidate_windows:
-            explicit_count = sum(1 for item in candidate if item.get("explicit"))
-            total_score = sum(item["score"] for item in candidate)
-            window_key = (explicit_count, len(candidate), total_score, -candidate[0]["page"]["page_num"])
-            if best_key is None or window_key > best_key:
-                best_key = window_key
-                best_window = candidate
-
-    if best_window:
-        return [item["page"] for item in best_window[:max_pages]]
-    return [item["page"] for item in ranked_pages[:max_pages]]
+    return [item["page"] for item in contiguous[:max_pages]]
 
 
 def is_toc_header_line(line: str, toc_markers: list[str]) -> bool:
@@ -2658,7 +2665,7 @@ async def generate_index(req: IndexRequest):
                 rule_quality["ascending_ratio"],
                 rule_quality["rejected_titles"],
             )
-            if rule_quality["accepted"]:
+            if rule_quality["accepted"] and toc_acceptance_floor(rule_quality, candidate_pages):
                 result["accepted_items"] = rule_quality["items"]
                 result["accepted_source"] = "toc"
 
@@ -2712,7 +2719,7 @@ Return only valid JSON:
                     text_quality["ascending_ratio"],
                     text_quality["rejected_titles"],
                 )
-                if text_quality["accepted"]:
+                if text_quality["accepted"] and toc_acceptance_floor(text_quality, candidate_pages):
                     result["accepted_items"] = text_quality["items"]
                     result["accepted_source"] = "toc"
             elif toc_raw.strip():
@@ -2732,7 +2739,7 @@ Return only valid JSON:
                     image_quality["ascending_ratio"],
                     image_quality["rejected_titles"],
                 )
-                if image_quality["accepted"]:
+                if image_quality["accepted"] and toc_acceptance_floor(image_quality, candidate_pages):
                     result["accepted_items"] = image_quality["items"]
                     result["accepted_source"] = "toc-image"
 
