@@ -1239,8 +1239,12 @@ def select_toc_pages_for_extraction(ranked_pages: list[dict], max_pages: int = 3
 
 
 def is_toc_header_line(line: str, toc_markers: list[str]) -> bool:
-    lower = line.lower()
-    return any(marker in lower for marker in toc_markers) or any(
+    lower = (line or "").strip().lower()
+    if re.match(r"^\d{1,3}[\)\.\-: ]+", lower):
+        return False
+    if re.search(r"\d{1,4}(?:\s*[\-–—]\s*\d{1,4})?\s*$", lower) and len(lower.split()) > 1:
+        return False
+    return lower in toc_markers or any(
         re.search(pattern, lower, flags=re.IGNORECASE)
         for pattern in TOC_TABLE_HEADER_PATTERNS
     )
@@ -1268,6 +1272,7 @@ TOC_NOISE_MARKERS = {
     "respondent",
     "versus",
     "appellant",
+    "applicant",
     "non-applicant",
     "high court of",
     "principal seat",
@@ -1402,7 +1407,7 @@ def filter_toc_lines(text: str, toc_markers: list[str]) -> list[str]:
     range_sep = r"[\-\u2013\u2014]"
     for raw_line in (text or "").splitlines():
         line = normalize_page_digits(re.sub(r"\s+", " ", raw_line)).strip(" |\t")
-        if len(line) < 2:
+        if len(line) < 1:
             previous_was_row = False
             continue
         if is_toc_stop_line(line):
@@ -1417,11 +1422,15 @@ def filter_toc_lines(text: str, toc_markers: list[str]) -> list[str]:
             seen_table_header = True
         elif re.match(rf"^\d{{1,3}}[\)\.\-: ]+.+?(?:\.{{2,}}\s*)?\d{{1,4}}(?:\s*{range_sep}\s*\d{{1,4}})?\s*$", line):
             keep = True
+        elif seen_table_header and re.match(r"^\d{1,3}[\)\.\-: ]+.+$", line):
+            keep = True
         elif re.search(rf"\.{{2,}}\s*\d{{1,4}}(?:\s*{range_sep}\s*\d{{1,4}})?\s*$", line):
             keep = True
+        elif re.fullmatch(rf"\d{{1,4}}(?:\s*{range_sep}\s*\d{{1,4}})?", line):
+            keep = seen_table_header and previous_was_row
         elif re.search(rf"\b\d{{1,4}}\s*{range_sep}\s*\d{{1,4}}\b", line):
             keep = seen_table_header or not is_toc_noise_line(line)
-        elif previous_was_row and len(line) <= 160 and not is_toc_header_line(line, toc_markers) and not is_toc_noise_line(line):
+        elif previous_was_row and len(line) <= 220 and not is_toc_header_line(line, toc_markers) and not is_toc_noise_line(line):
             keep = True
 
         if keep:
@@ -1432,11 +1441,51 @@ def filter_toc_lines(text: str, toc_markers: list[str]) -> list[str]:
 
 def parse_rule_based_toc_items(lines: list[str], default_source: str = "toc") -> list[dict]:
     items = []
+    pending_item = None
+
+    def append_title(target: dict, extra_text: str):
+        extra = extra_text.strip()
+        if not extra:
+            return
+        target["title"] = f"{target['title']} {extra}".strip()
+        target["displayTitle"] = target["title"]
+        target["originalTitle"] = target["title"]
+
+    def make_item(serial: str, title: str, page_from: int | None = None, page_to: int | None = None):
+        clean_title = title.strip()
+        return {
+            "serialNo": serial,
+            "title": clean_title,
+            "displayTitle": clean_title,
+            "originalTitle": clean_title,
+            "pageFrom": page_from,
+            "pageTo": page_to,
+            "courtFee": "",
+            "source": default_source,
+        }
+
+    def finalize_pending_if_ready():
+        nonlocal pending_item
+        if pending_item and pending_item.get("title") and pending_item.get("pageFrom") is not None:
+            items.append(pending_item)
+            pending_item = None
+
     for line in lines:
         normalized_line = normalize_page_digits(re.sub(r"\s+", " ", line)).strip()
-        if len(normalized_line) < 4:
+        if len(normalized_line) < 1:
             continue
         if any(re.search(pattern, normalized_line.lower(), flags=re.IGNORECASE) for pattern in TOC_TABLE_HEADER_PATTERNS):
+            continue
+
+        standalone_page_match = re.fullmatch(r"(?P<from>\d{1,4})(?:\s*[\-\u2013\u2014]\s*(?P<to>\d{1,4}))?", normalized_line)
+        if standalone_page_match and pending_item:
+            page_from = int(standalone_page_match.group("from"))
+            page_to = int(standalone_page_match.group("to") or page_from)
+            if page_to < page_from:
+                page_to = page_from
+            pending_item["pageFrom"] = page_from
+            pending_item["pageTo"] = page_to
+            finalize_pending_if_ready()
             continue
 
         serial = ""
@@ -1447,35 +1496,43 @@ def parse_rule_based_toc_items(lines: list[str], default_source: str = "toc") ->
             body = serial_match.group("body").strip()
 
         page_match = re.search(r"(?P<from>\d{1,4})(?:\s*[\-\u2013\u2014]\s*(?P<to>\d{1,4}))?\s*$", body)
-        if not page_match:
-            if items and len(body) <= 180:
-                items[-1]["title"] = f"{items[-1]['title']} {body}".strip()
-                items[-1]["displayTitle"] = items[-1]["title"]
-                items[-1]["originalTitle"] = items[-1]["title"]
+        if page_match:
+            title = body[:page_match.start()].rstrip(" .:-|\t")
+            title = re.sub(r"\.{2,}$", "", title).strip()
+            page_from = int(page_match.group("from"))
+            page_to = int(page_match.group("to") or page_from)
+            if page_to < page_from:
+                page_to = page_from
+            if len(title) >= 3:
+                finalize_pending_if_ready()
+                items.append(make_item(serial, title, page_from=page_from, page_to=page_to))
+                continue
+            if pending_item:
+                pending_item["pageFrom"] = page_from
+                pending_item["pageTo"] = page_to
+                finalize_pending_if_ready()
             continue
 
-        title = body[:page_match.start()].rstrip(" .:-|\t")
-        title = re.sub(r"\.{2,}$", "", title).strip()
-        if len(title) < 3:
+        if len(body) < 3:
             continue
 
-        page_from = int(page_match.group("from"))
-        page_to = int(page_match.group("to") or page_from)
-        if page_to < page_from:
-            page_to = page_from
+        if serial:
+            finalize_pending_if_ready()
+            pending_item = make_item(serial, body)
+            continue
 
-        items.append({
-            "serialNo": serial,
-            "title": title,
-            "displayTitle": title,
-            "originalTitle": title,
-            "pageFrom": page_from,
-            "pageTo": page_to,
-            "courtFee": "",
-            "source": default_source,
-        })
-    return items
+        if pending_item and len(body) <= 220:
+            append_title(pending_item, body)
+            continue
 
+        if items and len(body) <= 180:
+            append_title(items[-1], body)
+
+    finalize_pending_if_ready()
+    return [
+        item for item in items
+        if item.get("title") and item.get("pageFrom") is not None and not is_toc_noise_line(item.get("title", ""))
+    ]
 
 def combine_toc_items(*groups: list[dict]) -> list[dict]:
     combined = []
@@ -1991,6 +2048,8 @@ def smooth_generic_ranges(items: list[dict]) -> list[dict]:
 
     smoothed = [dict(item) for item in items]
     for idx, item in enumerate(smoothed):
+        if item.get("source") == "gap":
+            continue
         if item.get("title", "").lower() not in GENERIC_PARENT_NAMES:
             continue
         prev_item = smoothed[idx - 1] if idx > 0 else None
@@ -2039,11 +2098,20 @@ def classify_index_to_parent_documents(index_items: list[dict], all_pages: list[
 
     classified = []
     for item in index_items:
+        if item.get("source") == "gap":
+            classified.append(dict(item))
+            continue
         raw_title = item.get("title", "")
         preview = build_segment_preview(all_pages, item.get("pageFrom", 1), item.get("pageTo", 1))
-        scored = score_parent_documents(raw_title, preview)
-        candidates = shortlist_parent_documents(raw_title, preview)
-        chosen_title = choose_parent_document(raw_title, preview, candidates, scored)
+        direct = direct_parent_match(raw_title, preview)
+        if direct:
+            scored = [(10.0, direct)]
+            candidates = [direct]
+            chosen_title = direct
+        else:
+            scored = score_parent_documents(raw_title, preview)
+            candidates = shortlist_parent_documents(raw_title, preview)
+            chosen_title = choose_parent_document(raw_title, preview, candidates, scored)
         title = raw_title if should_preserve_original_title(item, raw_title, chosen_title, scored) else chosen_title
         classified.append({
             **item,
