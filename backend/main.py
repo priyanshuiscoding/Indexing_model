@@ -305,7 +305,16 @@ def export_index_json(
         "index_source": index_source,
         "status": (record or {}).get("status", "index_ready"),
         "index_entries": len(index_items or []),
-        "index": index_items or [],
+        "index": [
+            {
+                **item,
+                "pageFrom": item.get("tocPageFrom", item.get("pageFrom")),
+                "pageTo": item.get("tocPageTo", item.get("pageTo")),
+                "pdfPageFrom": item.get("pdfPageFrom", item.get("pageFrom")),
+                "pdfPageTo": item.get("pdfPageTo", item.get("pageTo")),
+            }
+            for item in (index_items or [])
+        ],
     }
     export_path = Path(INDEX_EXPORT_PATH) / f"{sanitize_export_stem(cnr_number)}.json"
     export_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -839,6 +848,8 @@ def parse_raw_index_items(items: list[dict], default_source: str) -> list[dict]:
             "originalTitle": str(item.get("originalTitle") or title).strip(),
             "pageFrom": pf,
             "pageTo": pt,
+            "tocPageFrom": pf,
+            "tocPageTo": pt,
             "source": item.get("source", default_source),
             "serialNo": str(item.get("serialNo", "")),
             "courtFee": str(item.get("courtFee", "")),
@@ -945,6 +956,8 @@ def normalize_index_items(
             **item,
             "pageFrom": pf,
             "pageTo": pt,
+            "pdfPageFrom": pf,
+            "pdfPageTo": pt,
         })
 
     normalized.sort(key=lambda x: (x["pageFrom"], x["pageTo"], x["title"]))
@@ -975,11 +988,19 @@ def build_toc_ranges_from_items(
     for idx, item in enumerate(normalized):
         current = dict(item)
         next_start = normalized[idx + 1]["pageFrom"] if idx + 1 < len(normalized) else None
+        next_toc_start = normalized[idx + 1].get("tocPageFrom") if idx + 1 < len(normalized) else None
         if next_start is not None and next_start > current["pageFrom"]:
             current["pageTo"] = max(current["pageFrom"], next_start - 1)
+            current["pdfPageTo"] = current["pageTo"]
         else:
             current["pageTo"] = max(current["pageFrom"], min(current["pageTo"], range_end))
+            current["pdfPageTo"] = current["pageTo"]
         current["pageTo"] = min(current["pageTo"], range_end)
+        current["pdfPageTo"] = min(current.get("pdfPageTo", current["pageTo"]), range_end)
+        if next_toc_start is not None and next_toc_start > current.get("tocPageFrom", current["pageFrom"]):
+            current["tocPageTo"] = max(current.get("tocPageFrom", current["pageFrom"]), next_toc_start - 1)
+        else:
+            current["tocPageTo"] = max(current.get("tocPageFrom", current["pageFrom"]), current.get("tocPageTo", current.get("tocPageFrom", current["pageFrom"])))
         ranged.append(current)
     return ranged
 
@@ -1873,6 +1894,10 @@ def merge_adjacent_ranges(items: list[dict]) -> list[dict]:
             and item.get("pageFrom") == prev.get("pageTo", 0) + 1
         ):
             prev["pageTo"] = item["pageTo"]
+            if item.get("pdfPageTo") is not None:
+                prev["pdfPageTo"] = item.get("pdfPageTo")
+            if item.get("tocPageTo") is not None:
+                prev["tocPageTo"] = item.get("tocPageTo")
             prev["source"] = prev.get("source") if prev.get("source") != "gap" else item.get("source", prev.get("source"))
             if not prev.get("serialNo"):
                 prev["serialNo"] = item.get("serialNo", "")
@@ -2679,6 +2704,8 @@ Return ONLY a valid JSON array (empty [] if nothing found):
                     "originalTitle": f"Pages {cursor}-{pf - 1}",
                     "pageFrom": cursor,
                     "pageTo": pf - 1,
+                    "pdfPageFrom": cursor,
+                    "pdfPageTo": pf - 1,
                     "source": "gap",
                     "serialNo": "",
                     "courtFee": "",
@@ -2690,6 +2717,10 @@ Return ONLY a valid JSON array (empty [] if nothing found):
                     "originalTitle": item.get("originalTitle") or item.get("title", f"Pages {pf}-{pt}"),
                     "pageFrom": pf,
                     "pageTo": pt,
+                    "pdfPageFrom": item.get("pdfPageFrom", pf),
+                    "pdfPageTo": item.get("pdfPageTo", pt),
+                    "tocPageFrom": item.get("tocPageFrom"),
+                    "tocPageTo": item.get("tocPageTo"),
                     "source": item.get("source", "auto"),
                     "serialNo": str(item.get("serialNo", "")),
                     "courtFee": str(item.get("courtFee", "")),
@@ -2703,6 +2734,8 @@ Return ONLY a valid JSON array (empty [] if nothing found):
                 "originalTitle": f"Pages {cursor}-{final_range_end}",
                 "pageFrom": cursor,
                 "pageTo": final_range_end,
+                "pdfPageFrom": cursor,
+                "pdfPageTo": final_range_end,
                 "source": "gap",
                 "serialNo": "",
                 "courtFee": "",

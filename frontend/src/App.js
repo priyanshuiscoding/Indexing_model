@@ -183,7 +183,29 @@ const normalizeSections = (items = [], batchNo = "") =>
     displayTitle: (item.displayTitle || item.originalTitle || "").trim(),
     originalTitle: (item.originalTitle || item.displayTitle || item.title || "").trim(),
     batchNo: (item.batchNo || batchNo || "").trim(),
+    pdfPageFrom: item.pdfPageFrom || item.pageFrom || 1,
+    pdfPageTo: item.pdfPageTo || item.pageTo || item.pageFrom || 1,
+    tocPageFrom: item.tocPageFrom || "",
+    tocPageTo: item.tocPageTo || "",
   }));
+
+const formatPageValue = (primaryFrom, primaryTo, fallbackFrom, fallbackTo, primaryLabel, fallbackLabel) => {
+  const primaryStart = Number(primaryFrom);
+  const primaryEnd = Number(primaryTo || primaryFrom);
+  if (!Number.isFinite(primaryStart) || primaryStart < 1) {
+    const fallbackStart = Number(fallbackFrom);
+    const fallbackEnd = Number(fallbackTo || fallbackFrom);
+    if (!Number.isFinite(fallbackStart) || fallbackStart < 1) return "-";
+    return fallbackStart === fallbackEnd ? String(fallbackStart) : `${fallbackStart}-${fallbackEnd}`;
+  }
+  const primaryText = primaryStart === primaryEnd ? `${primaryStart}` : `${primaryStart}-${primaryEnd}`;
+  const fallbackStart = Number(fallbackFrom);
+  const fallbackEnd = Number(fallbackTo || fallbackFrom);
+  if (!Number.isFinite(fallbackStart) || fallbackStart < 1) return primaryText;
+  const fallbackText = fallbackStart === fallbackEnd ? `${fallbackStart}` : `${fallbackStart}-${fallbackEnd}`;
+  if (primaryText === fallbackText) return primaryText;
+  return `${primaryLabel} ${primaryText} | ${fallbackLabel} ${fallbackText}`;
+};
 
 function PDFPage({ doc, pageNum, scale, isActive, onVisible }) {
   const canvasRef = useRef(null);
@@ -1475,8 +1497,8 @@ export default function App() {
                               </div>
                             </td>
                             <td className="col-batch"><span className="batch-pill">{sec.batchNo || "-"}</span></td>
-                            <td className="col-page">{sec.pageFrom}</td>
-                            <td className="col-page">{sec.pageTo}</td>
+                            <td className="col-page">{formatPageValue(sec.tocPageFrom, sec.tocPageFrom || sec.tocPageTo, sec.pdfPageFrom || sec.pageFrom, sec.pdfPageFrom || sec.pageFrom, "TOC", "PDF")}</td>
+                            <td className="col-page">{formatPageValue(sec.tocPageTo, sec.tocPageTo || sec.tocPageFrom, sec.pdfPageTo || sec.pageTo, sec.pdfPageTo || sec.pageTo, "TOC", "PDF")}</td>
                             <td className="col-action">
                               <button className="action-btn edit-btn" onClick={(e) => { e.stopPropagation(); setEditingIdx(editingIdx === idx ? null : idx); }}>Edit</button>
                             </td>
