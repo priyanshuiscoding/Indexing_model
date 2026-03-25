@@ -17,6 +17,7 @@ import hashlib
 import logging
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import nullcontext
 from pathlib import Path
 from io import BytesIO
@@ -84,6 +85,7 @@ ENABLE_HANDWRITTEN_HINDI_ASSIST = os.getenv("ENABLE_HANDWRITTEN_HINDI_ASSIST", "
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 EMBEDDING_BATCH_SIZE = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "64")))
 VECTOR_DB_BATCH_SIZE = max(1, int(os.getenv("VECTOR_DB_BATCH_SIZE", "128")))
+OCR_WORKER_COUNT = max(1, int(os.getenv("OCR_WORKER_COUNT", "4")))
 PREFER_CUDA_EMBEDDINGS = os.getenv("PREFER_CUDA_EMBEDDINGS", "true").lower() != "false"
 try:
     PARENT_DOCUMENT_CATALOG = json.loads(DOCUMENT_CATALOG_PATH.read_text(encoding="utf-8"))
@@ -1483,6 +1485,55 @@ def combine_toc_items(*groups: list[dict]) -> list[dict]:
     return combined
 
 
+def finalize_extracted_page(page_num: int, page_data: dict) -> dict:
+    text_value = page_data.get("text") or f"[Page {page_num} - no readable text detected]"
+    extraction_method = page_data.get("extraction_method", "digital")
+    source = "direct_text"
+    if extraction_method == "ocr":
+        source = "ocr"
+    elif extraction_method == "vision_ocr":
+        source = "vision"
+    return {
+        "page_num": page_num,
+        "text": text_value,
+        "used_ocr": bool(page_data.get("used_ocr")),
+        "vision_used": bool(page_data.get("vision_used")),
+        "handwriting_suspected": bool(page_data.get("handwriting_suspected")),
+        "extraction_method": extraction_method,
+        "source": source,
+        "ocr_used": bool(page_data.get("used_ocr")),
+        "char_count": len(text_value),
+    }
+
+
+def summarize_extracted_pages(pages_data: list[dict], total_pages: int, worker_count: int, pdf_id: str = "") -> dict:
+    ocr_count = sum(1 for page in pages_data if page.get("used_ocr"))
+    vision_ocr_count = sum(1 for page in pages_data if page.get("vision_used"))
+    handwriting_count = sum(1 for page in pages_data if page.get("handwriting_suspected"))
+    direct_text_count = sum(1 for page in pages_data if page.get("source") == "direct_text")
+    stats = {
+        "ocr_pages": ocr_count,
+        "vision_ocr_pages": vision_ocr_count,
+        "handwriting_suspected_pages": handwriting_count,
+        "digital_pages": direct_text_count,
+        "direct_text_pages": direct_text_count,
+        "total_pages_processed": len(pages_data),
+        "skipped_ocr_pages": len(pages_data) - ocr_count,
+        "worker_count": worker_count,
+    }
+    log.info(
+        "[VECTORIZE] pdf=%s extraction summary total_pages=%s workers=%s direct_text_pages=%s ocr_pages=%s skipped_ocr_pages=%s vision_pages=%s",
+        pdf_id or "-",
+        total_pages,
+        worker_count,
+        stats["direct_text_pages"],
+        stats["ocr_pages"],
+        stats["skipped_ocr_pages"],
+        stats["vision_ocr_pages"],
+    )
+    return stats
+
+
 def extract_pages_from_document(
     doc: fitz.Document,
     page_numbers: list[int],
@@ -1491,52 +1542,107 @@ def extract_pages_from_document(
     timing_collector: Optional[PdfTimingCollector] = None,
 ) -> tuple[list[dict], dict]:
     pages_data = []
-    ocr_count = 0
-    vision_ocr_count = 0
-    handwriting_count = 0
 
     for page_num in page_numbers:
         page = doc[page_num - 1]
         page_data = extract_page_content(page, page_num, dpi=dpi, timing_collector=timing_collector)
-        text_value = page_data["text"] or f"[Page {page_num} - no readable text detected]"
-        if page_data["used_ocr"]:
-            ocr_count += 1
-        if page_data["vision_used"]:
-            vision_ocr_count += 1
-        if page_data["handwriting_suspected"]:
-            handwriting_count += 1
-
-        pages_data.append({
-            "page_num": page_num,
-            "text": text_value,
-            "used_ocr": page_data["used_ocr"],
-            "vision_used": page_data["vision_used"],
-            "handwriting_suspected": page_data["handwriting_suspected"],
-            "extraction_method": page_data["extraction_method"],
-        })
+        finalized = finalize_extracted_page(page_num, page_data)
+        pages_data.append(finalized)
         log.info(
             "  Page %s/%s - %s%s - %s chars",
             page_num,
             total_pages,
-            page_data["extraction_method"],
-            " (handwriting assist)" if page_data["vision_used"] else "",
-            len(text_value),
+            finalized["extraction_method"],
+            " (handwriting assist)" if finalized["vision_used"] else "",
+            finalized["char_count"],
         )
 
-    stats = {
-        "ocr_pages": ocr_count,
-        "vision_ocr_pages": vision_ocr_count,
-        "handwriting_suspected_pages": handwriting_count,
-        "digital_pages": len(page_numbers) - ocr_count,
-        "total_pages_processed": len(page_numbers),
-        "skipped_ocr_pages": len(page_numbers) - ocr_count,
+    stats = summarize_extracted_pages(pages_data, total_pages, worker_count=1)
+    return pages_data, stats
+
+
+def _extract_page_from_pdf_worker(pdf_path_str: str, page_num: int, total_pages: int, dpi: int = 250) -> dict:
+    doc = fitz.open(pdf_path_str)
+    try:
+        page = doc[page_num - 1]
+        page_data = extract_page_content(page, page_num, dpi=dpi, timing_collector=None)
+    finally:
+        doc.close()
+    finalized = finalize_extracted_page(page_num, page_data)
+    return {
+        **finalized,
+        "page_number": page_num,
     }
+
+
+def extract_pages_from_pdf_parallel(
+    pdf_path: Path,
+    page_numbers: list[int],
+    total_pages: int,
+    dpi: int = 250,
+    timing_collector: Optional[PdfTimingCollector] = None,
+    worker_count: Optional[int] = None,
+    pdf_id: str = "",
+) -> tuple[list[dict], dict]:
+    if not page_numbers:
+        return [], summarize_extracted_pages([], total_pages, worker_count=0, pdf_id=pdf_id)
+
+    effective_workers = max(1, min(int(worker_count or OCR_WORKER_COUNT), len(page_numbers)))
     log.info(
-        "[VECTORIZE] extraction summary total_pages=%s ocr_pages=%s skipped_ocr_pages=%s vision_pages=%s",
-        stats["total_pages_processed"],
-        stats["ocr_pages"],
-        stats["skipped_ocr_pages"],
-        stats["vision_ocr_pages"],
+        "[VECTORIZE] pdf=%s starting parallel extraction total_pages=%s worker_count=%s dpi=%s",
+        pdf_id or "-",
+        len(page_numbers),
+        effective_workers,
+        dpi,
+    )
+
+    if effective_workers == 1:
+        with fitz.open(pdf_path) as doc:
+            pages_data, stats = extract_pages_from_document(doc, page_numbers, total_pages, dpi=dpi, timing_collector=timing_collector)
+        stats["worker_count"] = 1
+        return pages_data, stats
+
+    started = time.perf_counter()
+    pages_data = []
+    try:
+        with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+            future_map = {
+                executor.submit(_extract_page_from_pdf_worker, str(pdf_path), page_num, total_pages, dpi): page_num
+                for page_num in page_numbers
+            }
+            for future in as_completed(future_map):
+                page_num = future_map[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    log.exception("[VECTORIZE] pdf=%s worker failed for page=%s; falling back to sequential extraction", pdf_id or "-", page_num)
+                    raise exc
+                pages_data.append({
+                    "page_num": result["page_number"],
+                    "text": result["text"],
+                    "used_ocr": result["used_ocr"],
+                    "vision_used": result["vision_used"],
+                    "handwriting_suspected": result["handwriting_suspected"],
+                    "extraction_method": result["extraction_method"],
+                    "source": result["source"],
+                    "ocr_used": result["ocr_used"],
+                    "char_count": result["char_count"],
+                })
+    except Exception:
+        with fitz.open(pdf_path) as doc:
+            pages_data, stats = extract_pages_from_document(doc, page_numbers, total_pages, dpi=dpi, timing_collector=timing_collector)
+        stats["worker_count"] = 1
+        return pages_data, stats
+
+    pages_data.sort(key=lambda item: item["page_num"])
+    elapsed = time.perf_counter() - started
+    stats = summarize_extracted_pages(pages_data, total_pages, worker_count=effective_workers, pdf_id=pdf_id)
+    log.info(
+        "[VECTORIZE] pdf=%s parallel extraction completed processed_pages=%s worker_count=%s extraction_time=%.3fs",
+        pdf_id or "-",
+        len(pages_data),
+        effective_workers,
+        elapsed,
     )
     return pages_data, stats
 
@@ -1579,12 +1685,13 @@ def upsert_collection_pages(
     total_chunks = len(vector_chunks)
     batch_size = VECTOR_DB_BATCH_SIZE
     log.info(
-        "[VECTORIZE] pdf=%s total_chunks=%s db_batch_size=%s embedding_batch_size=%s embedding_device=%s",
+        "[VECTORIZE] pdf=%s total_chunks=%s db_batch_size=%s embedding_batch_size=%s embedding_device=%s embedding_model=%s",
         pdf_id,
         total_chunks,
         batch_size,
         EMBEDDING_BATCH_SIZE,
         get_embedder_device(),
+        EMBEDDING_MODEL_NAME,
     )
 
     vectorization_scope = timing_collector.stage("total vectorization", "total_vectorization_time") if timing_collector else nullcontext()
@@ -1596,10 +1703,20 @@ def upsert_collection_pages(
         embedding_started = time.perf_counter()
         documents = [chunk["text"] for chunk in vector_chunks]
         embeddings = embed_texts(documents, batch_size=EMBEDDING_BATCH_SIZE, pdf_id=pdf_id)
+        embedding_elapsed = time.perf_counter() - embedding_started
+        log.info(
+            "[VECTORIZE] pdf=%s embedding completed total_chunks=%s batch_size=%s device=%s total_time=%.3fs",
+            pdf_id,
+            total_chunks,
+            EMBEDDING_BATCH_SIZE,
+            get_embedder_device(),
+            embedding_elapsed,
+        )
         if timing_collector:
-            timing_collector.add_duration("embedding_time", time.perf_counter() - embedding_started)
+            timing_collector.add_duration("embedding_time", embedding_elapsed)
 
         total_batches = math.ceil(total_chunks / batch_size)
+        total_db_insert_time = 0.0
         for batch_index in range(0, total_chunks, batch_size):
             batch = vector_chunks[batch_index:batch_index + batch_size]
             batch_embeddings = embeddings[batch_index:batch_index + batch_size]
@@ -1611,6 +1728,7 @@ def upsert_collection_pages(
                 embeddings=batch_embeddings,
             )
             elapsed = time.perf_counter() - db_insert_started
+            total_db_insert_time += elapsed
             log.info(
                 "[VECTORIZE] pdf=%s db batch %s/%s size=%s took %.3fs",
                 pdf_id,
@@ -1621,6 +1739,12 @@ def upsert_collection_pages(
             )
             if timing_collector:
                 timing_collector.add_duration("vector_db_insert_time", elapsed)
+        log.info(
+            "[VECTORIZE] pdf=%s chroma upsert completed total_batches=%s total_insert_time=%.3fs",
+            pdf_id,
+            total_batches,
+            total_db_insert_time,
+        )
     return collection
 
 def load_collection_pages(pdf_id: str) -> list[dict]:
@@ -3011,12 +3135,18 @@ def process_pending_pdf_impl(pdf_id: str):
     update_pdf_record(pdf_id, status="full_ingestion_running", retrieval_status="full_ingestion_running")
     timing_collector = PdfTimingCollector(pdf_id, record.get("filename", ""))
     with timing_collector.stage("file open", "file_open"):
-        doc = fitz.open(pdf_path)
-    try:
-        with timing_collector.stage("full text extraction", "full_text_extraction_time"):
-            pages_data, stats = extract_pages_from_document(doc, pending_page_numbers, record["total_pages"], dpi=250, timing_collector=timing_collector)
-    finally:
-        doc.close()
+        with fitz.open(pdf_path) as probe_doc:
+            _ = probe_doc.page_count
+    with timing_collector.stage("full text extraction", "full_text_extraction_time"):
+        pages_data, stats = extract_pages_from_pdf_parallel(
+            pdf_path,
+            pending_page_numbers,
+            record["total_pages"],
+            dpi=250,
+            timing_collector=timing_collector,
+            worker_count=OCR_WORKER_COUNT,
+            pdf_id=pdf_id,
+        )
 
     upsert_extracted_pages(pdf_id, pages_data, stage="deferred_ingestion")
     upsert_collection_pages(pdf_id, record["filename"], pages_data, reset=False, timing_collector=timing_collector)
@@ -3278,11 +3408,12 @@ async def startup():
     log.info(f"Text model   : {LOCAL_TEXT_MODEL}")
     log.info(f"ChromaDB path: {CHROMA_DB_PATH}")
     log.info(
-        "Embedding config: model=%s preferred_device=%s embedding_batch_size=%s db_batch_size=%s",
+        "Embedding config: model=%s preferred_device=%s embedding_batch_size=%s db_batch_size=%s ocr_worker_count=%s",
         EMBEDDING_MODEL_NAME,
         resolve_embedding_device(),
         EMBEDDING_BATCH_SIZE,
         VECTOR_DB_BATCH_SIZE,
+        OCR_WORKER_COUNT,
     )
     await asyncio.to_thread(get_embedder)
     log.info("Server ready")
