@@ -1207,6 +1207,37 @@ def toc_acceptance_floor(quality: dict, candidate_pages: list[dict]) -> bool:
     return False
 
 
+def should_force_image_toc_retry(candidate_pages: list[dict], result: dict, toc_markers: list[str], rule_quality: Optional[dict] = None) -> bool:
+    if not candidate_pages:
+        return False
+
+    ocr_pages = len(result.get("ocr_pages") or [])
+    candidate_line_count = int(result.get("candidate_line_count") or 0)
+    explicit_signal = False
+    for page in candidate_pages:
+        page_text = page.get("text", "")
+        features = analyze_toc_page_features(page_text, toc_markers)
+        if has_explicit_toc_signal(page_text, features):
+            explicit_signal = True
+            break
+
+    scanned_or_noisy = ocr_pages >= max(1, len(candidate_pages)) or any(page.get("vision_used") for page in candidate_pages)
+    strong_rule = bool(
+        rule_quality
+        and rule_quality.get("accepted")
+        and int(rule_quality.get("kept_items") or 0) >= 3
+        and float(rule_quality.get("coverage_ratio") or 0.0) >= 0.75
+    )
+    weak_rule = (
+        not rule_quality
+        or not rule_quality.get("accepted")
+        or int(rule_quality.get("kept_items") or 0) < 3
+        or float(rule_quality.get("coverage_ratio") or 0.0) < 0.75
+    )
+    sparse_lines = candidate_line_count <= 14
+    return explicit_signal and scanned_or_noisy and not strong_rule and (weak_rule or sparse_lines)
+
+
 def rank_toc_candidate_pages(candidate_pages: list[dict], toc_markers: list[str]) -> list[dict]:
     ranked = []
     for page in candidate_pages:
@@ -2614,6 +2645,7 @@ async def generate_index(req: IndexRequest):
             "candidate_line_count": 0,
             "ocr_pages": [],
             "skipped_pages": [],
+            "force_image_retry": False,
         }
         if not candidate_pages:
             return result
@@ -2652,6 +2684,7 @@ async def generate_index(req: IndexRequest):
         log.info("TOC candidate line count for %s: %s", req.pdf_id, result["candidate_line_count"])
         debug_dump("TOC filtered lines", "\n".join(filtered_lines))
 
+        rule_quality = None
         result["rule_items"] = parse_rule_based_toc_items(filtered_lines, default_source="toc")
         if result["rule_items"]:
             log.info("Rule-based TOC parsing found %s rows from pages %s", len(result["rule_items"]), result["page_nums"])
@@ -2669,7 +2702,11 @@ async def generate_index(req: IndexRequest):
                 result["accepted_items"] = rule_quality["items"]
                 result["accepted_source"] = "toc"
 
-        if allow_text_llm and not result["accepted_items"] and filtered_lines:
+        result["force_image_retry"] = should_force_image_toc_retry(candidate_pages, result, toc_markers, rule_quality)
+        if result["force_image_retry"]:
+            log.info("Forcing TOC image retry for %s on pages %s after weak/noisy scanned TOC parse", req.pdf_id, result["page_nums"])
+
+        if allow_text_llm and not result["accepted_items"] and filtered_lines and not result["force_image_retry"]:
             toc_prompt = f"""You are reading filtered TOC candidate lines from an Indian court document.
 These lines may come from a real Table of Contents / Index spanning multiple pages.
 
@@ -2795,6 +2832,7 @@ Return only valid JSON:
         combined_toc_items = first_pass["accepted_items"]
         toc_source = first_pass["accepted_source"]
         candidate_line_count = first_pass["candidate_line_count"]
+        force_image_retry = bool(first_pass.get("force_image_retry"))
 
         image_fallback_pages = []
         if fallback_selected_pages and fallback_page_nums != toc_page_nums:
@@ -2802,14 +2840,18 @@ Return only valid JSON:
         elif selected_pages:
             image_fallback_pages = selected_pages
 
-        if not combined_toc_items and image_fallback_pages:
+        if force_image_retry:
+            image_fallback_pages = first_text_pages or image_fallback_pages
+
+        if (not combined_toc_items or force_image_retry) and image_fallback_pages:
             log.info("Retrying TOC extraction with image fallback pages for %s: %s", req.pdf_id, [page["page_num"] for page in image_fallback_pages])
             image_pass = run_toc_extraction(image_fallback_pages, allow_image_fallback=True, allow_text_llm=False)
             toc_page_nums = image_pass["page_nums"]
             toc_rule_items = image_pass["rule_items"]
             toc_text_items = image_pass["text_items"]
             toc_image_items = image_pass["image_items"]
-            combined_toc_items = image_pass["accepted_items"]
+            if image_pass["accepted_items"]:
+                combined_toc_items = image_pass["accepted_items"]
             toc_source = image_pass["accepted_source"] or toc_source
             candidate_line_count = image_pass["candidate_line_count"]
 
