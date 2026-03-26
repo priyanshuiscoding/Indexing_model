@@ -207,6 +207,29 @@ const formatPageValue = (primaryFrom, primaryTo, fallbackFrom, fallbackTo, prima
   return `${primaryLabel} ${primaryText} | ${fallbackLabel} ${fallbackText}`;
 };
 
+const getSavedPdfTone = (item = {}) => {
+  const status = String(item.status || "").toLowerCase();
+  const retrieval = String(item.retrieval_status || "").toLowerCase();
+  const pending = Number(item.pending_pages || 0);
+
+  if (status === "failed" || retrieval === "failed") return "error";
+  if (retrieval.includes("running") || status.includes("running")) return "running";
+  if (retrieval === "vectorized" || status === "vectorized" || item.chat_ready) return "ready";
+  if (status === "index_ready" || item.index_ready) return pending > 0 ? "staged" : "indexed";
+  if (pending > 0 || retrieval === "pending_deferred_ingestion" || retrieval === "queued_for_full_ingestion") return "queued";
+  return "neutral";
+};
+
+const getSavedPdfToneLabel = (tone) => {
+  if (tone === "ready") return "Vectorized";
+  if (tone === "indexed") return "Indexed";
+  if (tone === "staged") return "Indexed Only";
+  if (tone === "queued") return "Pending Queue";
+  if (tone === "running") return "Processing";
+  if (tone === "error") return "Needs Review";
+  return "Saved";
+};
+
 function PDFPage({ doc, pageNum, scale, isActive, onVisible }) {
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
@@ -285,6 +308,94 @@ function ConfirmModal({ message, onConfirm, onCancel }) {
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
           <button className="btn-ghost" onClick={onCancel}>Cancel</button>
           <button className="btn-danger" onClick={onConfirm}>Delete</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function QueueStatusModal({
+  open,
+  onClose,
+  savedPdfs,
+  queueSnapshot,
+  runner,
+  runnerStateLabel,
+  runnerLooksStuck,
+  runnerStopping,
+  heartbeatAgeSeconds,
+  indexRunner,
+  loading,
+  runAllDeferredQueue,
+  controlDeferredQueue,
+  forceResetQueue,
+}) {
+  if (!open) return null;
+
+  return (
+    <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal-box queue-modal-box">
+        <div className="queue-modal-header">
+          <div>
+            <div className="section-title">Queue And Live Status</div>
+            <div className="section-subtitle">Keep the advanced queue controls nearby, but out of the main indexing flow.</div>
+          </div>
+          <button className="modal-close" onClick={onClose}>x</button>
+        </div>
+        <div className="queue-toolbar">
+          <span className="queue-pill">Index queue: {savedPdfs.filter((item) => !item.index_ready).length}</span>
+          <span className="queue-pill">Deferred queue: {(queueSnapshot.pending_vectorization || []).length}</span>
+          {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused) && (
+            <span className="queue-pill success">{runnerStateLabel} {queueSnapshot.runner.processed}/{queueSnapshot.runner.total}: {queueSnapshot.runner.current_filename || queueSnapshot.runner.current_pdf_id || "Queue saved"}</span>
+          )}
+          {indexRunner.running && (
+            <span className="queue-pill success">Indexing: {indexRunner.current_filename || indexRunner.current_pdf_id || "Stage 1 running"}</span>
+          )}
+        </div>
+        <div className="queue-actions-grid">
+          <button className="queue-run-btn" onClick={runAllDeferredQueue} disabled={loading || queueSnapshot.runner?.running || queueSnapshot.runner?.paused}>Run All Deferred Queue</button>
+          <button className="queue-pause-btn" onClick={() => controlDeferredQueue("stop")} disabled={loading || !queueSnapshot.runner?.running}>Stop Queue</button>
+          <button className="queue-resume-btn" onClick={() => controlDeferredQueue("resume")} disabled={loading || !queueSnapshot.runner?.paused || queueSnapshot.runner?.running}>Resume Queue</button>
+          <button className="queue-reset-btn" onClick={() => forceResetQueue("index")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Index Queue</button>
+          <button className="queue-reset-btn" onClick={() => forceResetQueue("deferred")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Deferred Queue</button>
+        </div>
+        <div className="library-help">
+          Each saved PDF stays in the backend. Stage 1 saves the file and index first, then any remaining pages wait in the deferred queue until you process them.
+        </div>
+        <div className="runner-panel compact">
+          <div className="runner-panel-header">
+            <span className={`runner-state ${runnerLooksStuck ? "stuck" : runner.paused ? "paused" : runner.running ? "running" : "idle"}`}>{runnerStateLabel}</span>
+            <span className="runner-meta">Processed {runner.processed || 0} of {runner.total || 0}</span>
+            {runner.heartbeat_ts ? <span className="runner-meta">Last update {heartbeatAgeSeconds}s ago</span> : null}
+          </div>
+          <div className="runner-grid compact">
+            <div>
+              <div className="runner-label">Current PDF</div>
+              <div className="runner-value">{runner.current_filename || runner.current_pdf_id || "None"}</div>
+            </div>
+            <div>
+              <div className="runner-label">Queue State</div>
+              <div className="runner-value">{runner.paused ? "Deferred queue is paused in backend" : runnerStopping ? "Deferred queue will stop after the current PDF" : runner.running ? "Deferred queue is processing in backend" : "No background queue is running"}</div>
+            </div>
+            <div>
+              <div className="runner-label">Last Error</div>
+              <div className={`runner-value ${runner.last_error ? "error" : "muted"}`}>{runner.last_error || "No recent error"}</div>
+            </div>
+            <div>
+              <div className="runner-label">Operator Hint</div>
+              <div className={`runner-value ${runnerLooksStuck ? "error" : "muted"}`}>
+                {runnerLooksStuck
+                  ? "No heartbeat for more than 90 seconds. Check backend logs or use Force Reset if needed."
+                  : runner.paused
+                    ? "Queue is paused safely. Resume when you want backend processing to continue."
+                    : runnerStopping
+                      ? "Stop has been requested. The queue will pause after the current PDF finishes."
+                      : runner.running
+                        ? "Queue is active. You can keep working in the UI while it continues."
+                        : "Start the deferred queue when you want to vectorize all pending PDFs."}
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -664,7 +775,11 @@ export default function App() {
   const [editingIdx, setEditingIdx] = useState(null);
   const [confirmIdx, setConfirmIdx] = useState(null);
   const [confirmDeletePdf, setConfirmDeletePdf] = useState(null);
+  const [showQueueModal, setShowQueueModal] = useState(false);
+  const [indexSpotlight, setIndexSpotlight] = useState(false);
   const handledIndexRunnerRef = useRef("");
+  const indexSectionRef = useRef(null);
+  const indexSpotlightTimeoutRef = useRef(null);
 
   const rebuildCoverage = useCallback((items, total) => {
     const cmap = {};
@@ -680,6 +795,12 @@ export default function App() {
     if (coverageMap[currentPage] !== undefined) setActiveIdx(coverageMap[currentPage]);
     else setActiveIdx(null);
   }, [currentPage, coverageMap]);
+
+  useEffect(() => () => {
+    if (indexSpotlightTimeoutRef.current) {
+      window.clearTimeout(indexSpotlightTimeoutRef.current);
+    }
+  }, []);
 
   const handlePageVisible = useCallback((page) => setCurrentPage(page), []);
 
@@ -806,6 +927,26 @@ export default function App() {
       setLoadingStep("");
     }
   }, [rebuildCoverage]);
+
+  const spotlightIndexSection = useCallback(() => {
+    if (indexSpotlightTimeoutRef.current) {
+      window.clearTimeout(indexSpotlightTimeoutRef.current);
+    }
+    setIndexSpotlight(true);
+    window.requestAnimationFrame(() => {
+      indexSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    indexSpotlightTimeoutRef.current = window.setTimeout(() => setIndexSpotlight(false), 1800);
+  }, []);
+
+  const jumpToIndexView = useCallback(async (targetPdfId = "") => {
+    if (targetPdfId && targetPdfId !== pdfId) {
+      await loadSavedPdf(targetPdfId);
+    }
+    setTab("index");
+    setShowQueueModal(false);
+    window.setTimeout(() => spotlightIndexSection(), 120);
+  }, [loadSavedPdf, pdfId, spotlightIndexSection]);
 
   useEffect(() => {
     fetchSavedPdfs();
@@ -1189,6 +1330,17 @@ export default function App() {
   const runnerLooksStuck = Boolean(runner.running && heartbeatAgeSeconds > 90);
   const runnerStopping = Boolean(runner.running && runner.pause_requested);
   const runnerStateLabel = runnerLooksStuck ? "Stuck" : runner.paused ? "Paused" : runnerStopping ? "Stopping" : runner.running ? "Running" : "Idle";
+  const selectedSavedPdf = savedPdfs.find((item) => item.pdf_id === selectedSavedPdfId) || (pdfId ? {
+    pdf_id: pdfId,
+    status: workflowStatus,
+    retrieval_status: retrievalStatus,
+    pending_pages: pendingPages,
+    chat_ready: chatReady,
+    index_ready: workflowStatus === "index_ready",
+  } : null);
+  const activeTone = getSavedPdfTone(selectedSavedPdf || {});
+  const indexedPdfCount = savedPdfs.filter((item) => getSavedPdfTone(item) === "indexed" || getSavedPdfTone(item) === "staged").length;
+  const vectorizedPdfCount = savedPdfs.filter((item) => getSavedPdfTone(item) === "ready").length;
 
   const covered = Object.keys(coverageMap).length;
   const applicantName = caseInfo?.plaintiff
@@ -1253,38 +1405,51 @@ export default function App() {
       {error && <div className="error-bar">Warning: {error}</div>}
 
       <div className="main-body">
-        <div className="right-panel index-panel">
+        <div className={`right-panel index-panel tone-shell-${activeTone}`}>
           <div className="workspace-header">
             <div className="section-card library-card">
-              <div className="section-card-head">
+              <div className="section-card-head library-card-head">
                 <div>
                   <div className="section-title">Saved PDF Library</div>
-                  <div className="section-subtitle">Open any saved file and continue indexing, review, or chat without re-uploading.</div>
+                  <div className="section-subtitle">Open a file, jump straight to indexing, and keep queue controls tucked away until you need them.</div>
                 </div>
-                <div className="section-count">{savedPdfs.length} saved PDFs</div>
+                <div className="library-head-actions">
+                  <button className="queue-launch-btn" onClick={() => setShowQueueModal(true)}>
+                    Queue And Live Status
+                    {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused || indexRunner.running) && <span className="queue-launch-dot" />}
+                  </button>
+                  <div className="section-count">{savedPdfs.length} saved PDFs</div>
+                </div>
+              </div>
+              <div className="library-summary-strip">
+                <span className="queue-pill">Indexed: {indexedPdfCount}</span>
+                <span className="queue-pill success">Vectorized: {vectorizedPdfCount}</span>
+                <span className="queue-pill">Pending Queue: {(queueSnapshot.pending_vectorization || []).length}</span>
+              </div>
+              <div className="library-help subtle">
+                Soft color backgrounds help you spot what is indexed, what still needs vectorization, and what is actively running.
               </div>
               <div className="saved-pdf-list">
                 {savedPdfs.map((item) => {
                   const isDeferredBusy = queueSnapshot.runner?.running && queueSnapshot.runner?.current_pdf_id === item.pdf_id;
                   const isIndexBusy = queueSnapshot.index_runner?.running && queueSnapshot.index_runner?.current_pdf_id === item.pdf_id;
                   const deleteDisabled = loading || isDeferredBusy || isIndexBusy;
+                  const cardTone = getSavedPdfTone(item);
                   return (
-                    <button
+                    <div
                       key={item.pdf_id}
-                      type="button"
-                      onClick={() => loadSavedPdf(item.pdf_id)}
-                      className={`saved-pdf-card ${item.pdf_id === selectedSavedPdfId ? "selected" : ""}`}
+                      className={`saved-pdf-card tone-${cardTone} ${item.pdf_id === selectedSavedPdfId ? "selected" : ""}`}
                     >
                       <div className="saved-pdf-row">
-                        <div className="saved-pdf-title">{item.cnr_number || item.filename}</div>
+                        <div className="saved-pdf-heading">
+                          <div className="saved-pdf-title">{item.cnr_number || item.filename}</div>
+                          <span className={`saved-pdf-tone-pill tone-pill-${cardTone}`}>{getSavedPdfToneLabel(cardTone)}</span>
+                        </div>
                         <button
                           type="button"
                           className="saved-pdf-delete"
                           disabled={deleteDisabled}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setConfirmDeletePdf(item);
-                          }}
+                          onClick={() => setConfirmDeletePdf(item)}
                           title={deleteDisabled ? "This PDF is currently being processed" : "Delete this PDF and all saved data"}
                         >
                           Delete
@@ -1300,79 +1465,23 @@ export default function App() {
                         {isDeferredBusy || isIndexBusy
                           ? "This PDF is currently being processed, so deletion is temporarily locked."
                           : item.pending_pages > 0
-                            ? "Stage 1 is saved. You can process pending pages now or leave this PDF in the queue."
+                            ? "Stage 1 is saved. Index is ready, and remaining pages can be vectorized later."
                             : "This PDF is fully ready in the backend library."}
                       </div>
-                    </button>
+                      <div className="saved-pdf-actions">
+                        <button className="saved-pdf-open" onClick={() => loadSavedPdf(item.pdf_id)}>
+                          Open PDF
+                        </button>
+                        <button className="saved-pdf-index" onClick={() => jumpToIndexView(item.pdf_id)}>
+                          Index View
+                        </button>
+                      </div>
+                    </div>
                   );
                 })}
                 {savedPdfs.length === 0 && (
                   <div className="saved-pdf-empty">No saved PDFs yet. Upload one or use batch upload.</div>
                 )}
-              </div>
-            </div>
-
-            <div className="section-card queue-card">
-              <div className="section-card-head">
-                <div>
-                  <div className="section-title">Queue And Live Status</div>
-                  <div className="section-subtitle">Control deferred processing and check whether the backend is running, paused, idle, or stuck.</div>
-                </div>
-              </div>
-              <div className="queue-toolbar">
-                <span className="queue-pill">Index queue: {savedPdfs.filter((item) => !item.index_ready).length}</span>
-                <span className="queue-pill">Deferred queue: {(queueSnapshot.pending_vectorization || []).length}</span>
-                {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused) && (
-                  <span className="queue-pill success">{runnerStateLabel} {queueSnapshot.runner.processed}/{queueSnapshot.runner.total}: {queueSnapshot.runner.current_filename || queueSnapshot.runner.current_pdf_id || "Queue saved"}</span>
-                )}
-                {indexRunner.running && (
-                  <span className="queue-pill success">Indexing: {indexRunner.current_filename || indexRunner.current_pdf_id || "Stage 1 running"}</span>
-                )}
-              </div>
-              <div className="queue-actions-grid">
-                <button className="queue-run-btn" onClick={runAllDeferredQueue} disabled={loading || queueSnapshot.runner?.running || queueSnapshot.runner?.paused}>Run All Deferred Queue</button>
-                <button className="queue-pause-btn" onClick={() => controlDeferredQueue("stop")} disabled={loading || !queueSnapshot.runner?.running}>Stop Queue</button>
-                <button className="queue-resume-btn" onClick={() => controlDeferredQueue("resume")} disabled={loading || !queueSnapshot.runner?.paused || queueSnapshot.runner?.running}>Resume Queue</button>
-                <button className="queue-reset-btn" onClick={() => forceResetQueue("index")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Index Queue</button>
-                <button className="queue-reset-btn" onClick={() => forceResetQueue("deferred")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Deferred Queue</button>
-              </div>
-              <div className="library-help">
-                Each saved PDF stays in the backend. Stage 1 saves the file and index first, then any remaining pages wait in the deferred queue until you process them.
-              </div>
-              <div className="runner-panel compact">
-                <div className="runner-panel-header">
-                  <span className={`runner-state ${runnerLooksStuck ? "stuck" : runner.paused ? "paused" : runner.running ? "running" : "idle"}`}>{runnerStateLabel}</span>
-                  <span className="runner-meta">Processed {runner.processed || 0} of {runner.total || 0}</span>
-                  {runner.heartbeat_ts ? <span className="runner-meta">Last update {heartbeatAgeSeconds}s ago</span> : null}
-                </div>
-                <div className="runner-grid compact">
-                  <div>
-                    <div className="runner-label">Current PDF</div>
-                    <div className="runner-value">{runner.current_filename || runner.current_pdf_id || "None"}</div>
-                  </div>
-                  <div>
-                    <div className="runner-label">Queue State</div>
-                    <div className="runner-value">{runner.paused ? "Deferred queue is paused in backend" : runnerStopping ? "Deferred queue will stop after the current PDF" : runner.running ? "Deferred queue is processing in backend" : "No background queue is running"}</div>
-                  </div>
-                  <div>
-                    <div className="runner-label">Last Error</div>
-                    <div className={`runner-value ${runner.last_error ? "error" : "muted"}`}>{runner.last_error || "No recent error"}</div>
-                  </div>
-                  <div>
-                    <div className="runner-label">Operator Hint</div>
-                    <div className={`runner-value ${runnerLooksStuck ? "error" : "muted"}`}>
-                      {runnerLooksStuck
-                        ? "No heartbeat for more than 90 seconds. Check backend logs or use Force Reset if needed."
-                        : runner.paused
-                          ? "Queue is paused safely. Resume when you want backend processing to continue."
-                          : runnerStopping
-                            ? "Stop has been requested. The queue will pause after the current PDF finishes."
-                            : runner.running
-                              ? "Queue is active. You can keep working in the UI while it continues."
-                              : "Start the deferred queue when you want to vectorize all pending PDFs."}
-                    </div>
-                  </div>
-                </div>
               </div>
             </div>
           </div>
@@ -1386,7 +1495,7 @@ export default function App() {
           )}
 
           {pdfDoc && (
-            <div className="indexing-toolbar">
+            <div ref={indexSectionRef} className={`indexing-toolbar tone-panel-${activeTone} ${indexSpotlight ? "index-spotlight" : ""}`}>
               <div className="indexing-copy">
                 <div className="indexing-title">Indexing Controls</div>
                 <div className="indexing-hint">
@@ -1454,7 +1563,7 @@ export default function App() {
           )}
 
           {pdfDoc && (
-            <div className="tab-bar">
+            <div className={`tab-bar tone-panel-${activeTone}`}>
               <button className={`tab-btn ${tab === "index" ? "active" : ""}`} onClick={() => setTab("index")}>
                 Index Table
               </button>
@@ -1481,7 +1590,7 @@ export default function App() {
           )}
 
           {tab === "index" && (
-            <div className="content-panel index-content-panel">
+            <div className={`content-panel index-content-panel tone-panel-${activeTone}`}>
               {showAddPanel && (
                 <AddEntryPanel
                   totalPages={totalPages}
@@ -1597,7 +1706,7 @@ export default function App() {
           )}
         </div>
 
-        <div className="left-panel viewer-panel">
+        <div className={`left-panel viewer-panel viewer-tone-${activeTone}`}>
           {pdfDoc && (
             <div className="viewer-toolbar">
               <span className="toolbar-filename">{pdfFile?.name?.split(".")[0]}</span>
@@ -1655,6 +1764,23 @@ export default function App() {
           onCancel={() => setConfirmDeletePdf(null)}
         />
       )}
+
+      <QueueStatusModal
+        open={showQueueModal}
+        onClose={() => setShowQueueModal(false)}
+        savedPdfs={savedPdfs}
+        queueSnapshot={queueSnapshot}
+        runner={runner}
+        runnerStateLabel={runnerStateLabel}
+        runnerLooksStuck={runnerLooksStuck}
+        runnerStopping={runnerStopping}
+        heartbeatAgeSeconds={heartbeatAgeSeconds}
+        indexRunner={indexRunner}
+        loading={loading}
+        runAllDeferredQueue={runAllDeferredQueue}
+        controlDeferredQueue={controlDeferredQueue}
+        forceResetQueue={forceResetQueue}
+      />
     </div>
   );
 }
