@@ -95,6 +95,7 @@ def _init_sqlite_db():
         _ensure_column(conn, "pdf_records", "queue_bucket", "queue_bucket TEXT DEFAULT 'index'")
         _ensure_column(conn, "pdf_records", "deferred_decision", "deferred_decision TEXT DEFAULT 'pending'")
         _ensure_column(conn, "pdf_records", "last_error", "last_error TEXT DEFAULT ''")
+        _ensure_column(conn, "pdf_records", "review_reason", "review_reason TEXT DEFAULT ''")
         conn.commit()
     finally:
         conn.close()
@@ -106,6 +107,7 @@ def _init_postgres_db():
     try:
         with conn.cursor() as cur:
             cur.execute(schema_sql)
+            cur.execute("ALTER TABLE pdf_records ADD COLUMN IF NOT EXISTS review_reason TEXT NOT NULL DEFAULT ''")
         conn.commit()
     finally:
         conn.close()
@@ -159,6 +161,7 @@ def upsert_pdf_record(
     queue_bucket: str = "index",
     deferred_decision: str = "pending",
     last_error: str = "",
+    review_reason: str = "",
 ):
     now = utc_now_iso()
     pending_pages = pending_pages if pending_pages is not None else max(total_pages - indexed_pages, 0)
@@ -171,8 +174,8 @@ def upsert_pdf_record(
                     INSERT INTO pdf_records (
                         pdf_id, filename, cnr_number, file_size_bytes, total_pages, selected_start_page, selected_end_page,
                         indexed_pages, status, retrieval_status, index_ready, chat_ready,
-                        pending_pages, index_source, queue_bucket, deferred_decision, last_error, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        pending_pages, index_source, queue_bucket, deferred_decision, last_error, review_reason, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (pdf_id) DO UPDATE SET
                         filename = EXCLUDED.filename,
                         cnr_number = EXCLUDED.cnr_number,
@@ -190,12 +193,13 @@ def upsert_pdf_record(
                         queue_bucket = EXCLUDED.queue_bucket,
                         deferred_decision = EXCLUDED.deferred_decision,
                         last_error = EXCLUDED.last_error,
+                        review_reason = EXCLUDED.review_reason,
                         updated_at = EXCLUDED.updated_at
                     """,
                     (
                         pdf_id, filename, cnr_number, file_size_bytes, total_pages, selected_start_page,
                         selected_end_page, indexed_pages, status, retrieval_status, bool(index_ready), bool(chat_ready),
-                        pending_pages, index_source, queue_bucket, deferred_decision, last_error, now, now,
+                        pending_pages, index_source, queue_bucket, deferred_decision, last_error, review_reason, now, now,
                     ),
                 )
         else:
@@ -204,8 +208,8 @@ def upsert_pdf_record(
                 INSERT INTO pdf_records (
                     pdf_id, filename, cnr_number, file_size_bytes, total_pages, selected_start_page, selected_end_page,
                     indexed_pages, status, retrieval_status, index_ready, chat_ready,
-                    pending_pages, index_source, queue_bucket, deferred_decision, last_error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pending_pages, index_source, queue_bucket, deferred_decision, last_error, review_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pdf_id) DO UPDATE SET
                     filename = excluded.filename,
                     cnr_number = excluded.cnr_number,
@@ -223,12 +227,13 @@ def upsert_pdf_record(
                     queue_bucket = excluded.queue_bucket,
                     deferred_decision = excluded.deferred_decision,
                     last_error = excluded.last_error,
+                    review_reason = excluded.review_reason,
                     updated_at = excluded.updated_at
                 """,
                 (
                     pdf_id, filename, cnr_number, file_size_bytes, total_pages, selected_start_page,
                     selected_end_page, indexed_pages, status, retrieval_status, int(index_ready), int(chat_ready),
-                    pending_pages, index_source, queue_bucket, deferred_decision, last_error, now, now,
+                    pending_pages, index_source, queue_bucket, deferred_decision, last_error, review_reason, now, now,
                 ),
             )
         conn.commit()
@@ -483,7 +488,7 @@ def list_pdf_records(search: str = "") -> list[dict]:
                     SELECT pdf_id, filename, cnr_number, file_size_bytes, total_pages, indexed_pages,
                            selected_start_page, selected_end_page, status, retrieval_status,
                            index_ready, chat_ready, pending_pages, index_source, queue_bucket,
-                           deferred_decision, last_error, updated_at
+                           deferred_decision, last_error, review_reason, updated_at
                     FROM pdf_records
                     WHERE {' AND '.join(clauses)}
                     ORDER BY updated_at DESC
@@ -503,7 +508,7 @@ def list_pdf_records(search: str = "") -> list[dict]:
                 SELECT pdf_id, filename, cnr_number, file_size_bytes, total_pages, indexed_pages,
                        selected_start_page, selected_end_page, status, retrieval_status,
                        index_ready, chat_ready, pending_pages, index_source, queue_bucket,
-                       deferred_decision, last_error, updated_at
+                       deferred_decision, last_error, review_reason, updated_at
                 FROM pdf_records
                 WHERE {' AND '.join(clauses)}
                 ORDER BY updated_at DESC
@@ -534,12 +539,32 @@ def list_pending_pdf_ids() -> list[str]:
         conn.close()
 
 
+def list_reindex_review_pdf_ids() -> list[str]:
+    conn = get_connection()
+    try:
+        if _is_postgres():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pdf_id FROM pdf_records WHERE queue_bucket = %s ORDER BY updated_at ASC",
+                    ("reindex_review",),
+                )
+                rows = cur.fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT pdf_id FROM pdf_records WHERE queue_bucket = 'reindex_review' ORDER BY updated_at ASC"
+            ).fetchall()
+        return [row["pdf_id"] for row in rows]
+    finally:
+        conn.close()
+
+
 def build_queue_snapshot() -> dict:
     records = list_pdf_records()
     return {
         "index_ready": [record for record in records if record.get("index_ready")],
         "pending_vectorization": [record for record in records if record.get("pending_pages", 0) > 0],
         "vectorized": [record for record in records if record.get("chat_ready")],
+        "reindex_review": [record for record in records if record.get("queue_bucket") == "reindex_review"],
         "errors": [record for record in records if record.get("last_error")],
     }
 

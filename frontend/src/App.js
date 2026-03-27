@@ -4,6 +4,17 @@ import { documentCatalog } from "./documentCatalog";
 
 const API = process.env.REACT_APP_API_BASE || "";
 const SAVED_PDF_MEMORY_CACHE_LIMIT = 8;
+const EMPTY_QUEUE_SNAPSHOT = {
+  index_ready: [],
+  pending_vectorization: [],
+  vectorized: [],
+  reindex_review: [],
+  errors: [],
+  runner: { running: false, processed: 0, total: 0, current_pdf_id: "", current_filename: "", last_error: "", pause_requested: false, paused: false, heartbeat_ts: 0 },
+  index_runner: { running: false, current_pdf_id: "", current_filename: "", last_error: "", finished_pdf_id: "", finished_filename: "", status: "idle" },
+  audit_runner: { running: false, processed: 0, total: 0, flagged: 0, current_pdf_id: "", current_filename: "", last_error: "", heartbeat_ts: 0, status: "idle" },
+  reindex_runner: { running: false, processed: 0, total: 0, fixed: 0, current_pdf_id: "", current_filename: "", last_error: "", heartbeat_ts: 0, status: "idle" },
+};
 
 const getFetchErrorMessage = (err) => {
   if (err instanceof TypeError && /fetch/i.test(err.message)) {
@@ -213,6 +224,7 @@ const getSavedPdfTone = (item = {}) => {
   const retrieval = String(item.retrieval_status || "").toLowerCase();
   const pending = Number(item.pending_pages || 0);
 
+  if (item.queue_bucket === "reindex_review" || status === "needs_review" || item.review_reason) return "review";
   if (status === "failed" || retrieval === "failed") return "error";
   if (retrieval.includes("running") || status.includes("running")) return "running";
   if (retrieval === "vectorized" || status === "vectorized" || item.chat_ready) return "ready";
@@ -222,6 +234,7 @@ const getSavedPdfTone = (item = {}) => {
 };
 
 const getSavedPdfToneLabel = (tone) => {
+  if (tone === "review") return "Review Queue";
   if (tone === "ready") return "Vectorized";
   if (tone === "indexed") return "Indexed";
   if (tone === "staged") return "Indexed Only";
@@ -326,12 +339,26 @@ function QueueStatusModal({
   runnerStopping,
   heartbeatAgeSeconds,
   indexRunner,
+  auditRunner,
+  reindexRunner,
   loading,
   runAllDeferredQueue,
   controlDeferredQueue,
   forceResetQueue,
+  startIndexAudit,
+  runReviewReindexQueue,
+  auditRowStart,
+  auditRowEnd,
+  setAuditRowStart,
+  setAuditRowEnd,
+  pdfSearch,
+  batchFilter,
 }) {
   if (!open) return null;
+
+  const reviewQueueCount = (queueSnapshot.reindex_review || []).length;
+  const auditHeartbeatAgeSeconds = auditRunner?.heartbeat_ts ? Math.max(0, Math.round(Date.now() / 1000 - auditRunner.heartbeat_ts)) : 0;
+  const reindexHeartbeatAgeSeconds = reindexRunner?.heartbeat_ts ? Math.max(0, Math.round(Date.now() / 1000 - reindexRunner.heartbeat_ts)) : 0;
 
   return (
     <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
@@ -339,19 +366,54 @@ function QueueStatusModal({
         <div className="queue-modal-header">
           <div>
             <div className="section-title">Queue And Live Status</div>
-            <div className="section-subtitle">Keep the advanced queue controls nearby, but out of the main indexing flow.</div>
+            <div className="section-subtitle">Keep deferred processing, index audit, and review reindexing in one clean operations panel.</div>
           </div>
           <button className="modal-close" onClick={onClose}>x</button>
         </div>
         <div className="queue-toolbar">
           <span className="queue-pill">Index queue: {savedPdfs.filter((item) => !item.index_ready).length}</span>
           <span className="queue-pill">Deferred queue: {(queueSnapshot.pending_vectorization || []).length}</span>
+          <span className="queue-pill warning">Review queue: {reviewQueueCount}</span>
           {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused) && (
             <span className="queue-pill success">{runnerStateLabel} {queueSnapshot.runner.processed}/{queueSnapshot.runner.total}: {queueSnapshot.runner.current_filename || queueSnapshot.runner.current_pdf_id || "Queue saved"}</span>
           )}
           {indexRunner.running && (
             <span className="queue-pill success">Indexing: {indexRunner.current_filename || indexRunner.current_pdf_id || "Stage 1 running"}</span>
           )}
+          {auditRunner.running && (
+            <span className="queue-pill warning">Audit: {auditRunner.processed || 0}/{auditRunner.total || 0} - flagged {auditRunner.flagged || 0}</span>
+          )}
+          {reindexRunner.running && (
+            <span className="queue-pill success">Review Reindex: {reindexRunner.processed || 0}/{reindexRunner.total || 0}</span>
+          )}
+        </div>
+        <div className="queue-audit-panel">
+          <div className="queue-audit-copy">
+            Audit uses the current PDF search and Batch No. filters, then checks only fully vectorized PDFs for stale or weak indexes.
+          </div>
+          <div className="queue-audit-inputs">
+            <input
+              type="number"
+              min={1}
+              className="range-input queue-range-input"
+              value={auditRowStart}
+              onChange={(e) => setAuditRowStart(e.target.value)}
+              placeholder="From #"
+            />
+            <input
+              type="number"
+              min={1}
+              className="range-input queue-range-input"
+              value={auditRowEnd}
+              onChange={(e) => setAuditRowEnd(e.target.value)}
+              placeholder="To #"
+            />
+            <button className="queue-run-btn" onClick={startIndexAudit} disabled={loading || auditRunner.running || reindexRunner.running}>Audit Filtered PDFs</button>
+            <button className="queue-run-btn" onClick={runReviewReindexQueue} disabled={loading || reindexRunner.running || reviewQueueCount === 0}>Reindex Review Queue</button>
+          </div>
+          <div className="queue-audit-note">
+            Filters now: PDF Search <strong>{pdfSearch || "All"}</strong> - Batch No. <strong>{batchFilter || "All"}</strong> - Rows <strong>{auditRowStart || "1"}{auditRowEnd ? `-${auditRowEnd}` : "+"}</strong>
+          </div>
         </div>
         <div className="queue-actions-grid">
           <button className="queue-run-btn" onClick={runAllDeferredQueue} disabled={loading || queueSnapshot.runner?.running || queueSnapshot.runner?.paused}>Run All Deferred Queue</button>
@@ -359,9 +421,10 @@ function QueueStatusModal({
           <button className="queue-resume-btn" onClick={() => controlDeferredQueue("resume")} disabled={loading || !queueSnapshot.runner?.paused || queueSnapshot.runner?.running}>Resume Queue</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("index")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Index Queue</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("deferred")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Deferred Queue</button>
+          <button className="queue-reset-btn" onClick={() => forceResetQueue("reindex")} disabled={loading || reindexRunner.running}>Clear Review Queue</button>
         </div>
         <div className="library-help">
-          Each saved PDF stays in the backend. Stage 1 saves the file and index first, then any remaining pages wait in the deferred queue until you process them.
+          Deferred processing fills missing page text and vectors. The review queue is separate and only repairs bad saved indexes from already vectorized PDFs.
         </div>
         <div className="runner-panel compact">
           <div className="runner-panel-header">
@@ -395,6 +458,58 @@ function QueueStatusModal({
                         ? "Queue is active. You can keep working in the UI while it continues."
                         : "Start the deferred queue when you want to vectorize all pending PDFs."}
               </div>
+            </div>
+          </div>
+        </div>
+        <div className="runner-panel compact">
+          <div className="runner-panel-header">
+            <span className={`runner-state ${auditRunner.running ? "running" : "idle"}`}>{auditRunner.running ? "Audit Running" : "Audit Idle"}</span>
+            <span className="runner-meta">Processed {auditRunner.processed || 0} of {auditRunner.total || 0}</span>
+            <span className="runner-meta">Flagged {auditRunner.flagged || 0}</span>
+            {auditRunner.heartbeat_ts ? <span className="runner-meta">Last update {auditHeartbeatAgeSeconds}s ago</span> : null}
+          </div>
+          <div className="runner-grid compact">
+            <div>
+              <div className="runner-label">Current PDF</div>
+              <div className="runner-value">{auditRunner.current_filename || auditRunner.current_pdf_id || "None"}</div>
+            </div>
+            <div>
+              <div className="runner-label">Audit Scope</div>
+              <div className="runner-value muted">Checks saved indexes for full-document coverage and oversized gap patterns.</div>
+            </div>
+            <div>
+              <div className="runner-label">Last Error</div>
+              <div className={`runner-value ${auditRunner.last_error ? "error" : "muted"}`}>{auditRunner.last_error || "No recent error"}</div>
+            </div>
+            <div>
+              <div className="runner-label">Operator Hint</div>
+              <div className="runner-value muted">Run audit after batch vectorization when you want to isolate suspicious indexes instead of reindexing everything.</div>
+            </div>
+          </div>
+        </div>
+        <div className="runner-panel compact">
+          <div className="runner-panel-header">
+            <span className={`runner-state ${reindexRunner.running ? "running" : "idle"}`}>{reindexRunner.running ? "Review Reindex Running" : "Review Reindex Idle"}</span>
+            <span className="runner-meta">Processed {reindexRunner.processed || 0} of {reindexRunner.total || 0}</span>
+            <span className="runner-meta">Fixed {reindexRunner.fixed || 0}</span>
+            {reindexRunner.heartbeat_ts ? <span className="runner-meta">Last update {reindexHeartbeatAgeSeconds}s ago</span> : null}
+          </div>
+          <div className="runner-grid compact">
+            <div>
+              <div className="runner-label">Current PDF</div>
+              <div className="runner-value">{reindexRunner.current_filename || reindexRunner.current_pdf_id || "None"}</div>
+            </div>
+            <div>
+              <div className="runner-label">Review Queue</div>
+              <div className="runner-value">{reviewQueueCount > 0 ? `${reviewQueueCount} PDFs waiting for index repair` : "No PDFs are waiting in the review queue"}</div>
+            </div>
+            <div>
+              <div className="runner-label">Last Error</div>
+              <div className={`runner-value ${reindexRunner.last_error ? "error" : "muted"}`}>{reindexRunner.last_error || "No recent error"}</div>
+            </div>
+            <div>
+              <div className="runner-label">Operator Hint</div>
+              <div className="runner-value muted">This runner reuses saved page text from vectorized PDFs and repairs only the flagged index records.</div>
             </div>
           </div>
         </div>
@@ -759,7 +874,7 @@ export default function App() {
   const [chatReady, setChatReady] = useState(false);
   const [pdfSearch, setPdfSearch] = useState("");
   const [savedPdfs, setSavedPdfs] = useState([]);
-  const [queueSnapshot, setQueueSnapshot] = useState({ index_ready: [], pending_vectorization: [], vectorized: [], errors: [], runner: { running: false, processed: 0, total: 0, current_pdf_id: "", current_filename: "", last_error: "" }, index_runner: { running: false, current_pdf_id: "", current_filename: "", last_error: "", finished_pdf_id: "", finished_filename: "", status: "idle" } });
+  const [queueSnapshot, setQueueSnapshot] = useState(EMPTY_QUEUE_SNAPSHOT);
   const [selectedSavedPdfId, setSelectedSavedPdfId] = useState("");
 
   const [tab, setTab] = useState("index");
@@ -777,8 +892,11 @@ export default function App() {
   const [confirmIdx, setConfirmIdx] = useState(null);
   const [confirmDeletePdf, setConfirmDeletePdf] = useState(null);
   const [showQueueModal, setShowQueueModal] = useState(false);
+  const [auditRowStart, setAuditRowStart] = useState("1");
+  const [auditRowEnd, setAuditRowEnd] = useState("");
   const [indexSpotlight, setIndexSpotlight] = useState(false);
   const handledIndexRunnerRef = useRef("");
+  const handledReviewRunnerRef = useRef("");
   const indexSectionRef = useRef(null);
   const indexSpotlightTimeoutRef = useRef(null);
   const pdfCacheRef = useRef(new Map());
@@ -936,7 +1054,7 @@ export default function App() {
   const fetchQueues = useCallback(async () => {
     try {
       const resp = await apiFetch("/api/queues");
-      setQueueSnapshot(resp || { index_ready: [], pending_vectorization: [], vectorized: [], errors: [], runner: { running: false, processed: 0, total: 0, current_pdf_id: "", current_filename: "", last_error: "" }, index_runner: { running: false, current_pdf_id: "", current_filename: "", last_error: "", finished_pdf_id: "", finished_filename: "", status: "idle" } });
+      setQueueSnapshot(resp || EMPTY_QUEUE_SNAPSHOT);
     } catch (err) {
       console.error(err);
     }
@@ -1061,6 +1179,36 @@ export default function App() {
     fetchSavedPdfs(pdfSearch);
     fetchQueues();
   }, [queueSnapshot.index_runner, pdfId, caseInfo?.batchNo, rebuildCoverage, totalPages, fetchSavedPdfs, fetchQueues, pdfSearch]);
+
+  useEffect(() => {
+    const reindexRunner = queueSnapshot.reindex_runner || {};
+    const runnerKey = `${reindexRunner.running}-${reindexRunner.processed || 0}-${reindexRunner.fixed || 0}-${reindexRunner.heartbeat_ts || 0}`;
+    if (reindexRunner.running || (reindexRunner.processed || 0) === 0 || handledReviewRunnerRef.current === runnerKey) return;
+    handledReviewRunnerRef.current = runnerKey;
+
+    if (pdfId) {
+      apiFetch(`/api/pdfs/${pdfId}`)
+        .then((details) => {
+          const pdf = details.pdf || {};
+          const normalized = normalizeSections(details.index || [], caseInfo?.batchNo || "");
+          setSections(normalized);
+          rebuildCoverage(normalized, totalPages || pdf.total_pages || 0);
+          setWorkflowStatus(pdf.status || "");
+          setRetrievalStatus(pdf.retrieval_status || "");
+          setPendingPages(pdf.pending_pages || 0);
+          setChatReady(Boolean(pdf.chat_ready));
+          setIndexedRange({
+            start: pdf.selected_start_page || 1,
+            end: pdf.selected_end_page || Math.min(pdf.total_pages || totalPages || 1, 10),
+            count: pdf.indexed_pages || 0,
+          });
+        })
+        .catch((err) => setError(`Error: ${err.message}`));
+    }
+
+    fetchSavedPdfs(pdfSearch);
+    fetchQueues();
+  }, [queueSnapshot.reindex_runner, pdfId, caseInfo?.batchNo, rebuildCoverage, totalPages, fetchSavedPdfs, fetchQueues, pdfSearch]);
 
   const handleBatchUpload = async (e) => {
     const files = Array.from(e.target.files || []);
@@ -1385,6 +1533,45 @@ export default function App() {
     }
   };
 
+  const startIndexAudit = async () => {
+    setError("");
+    setLoading(true);
+    setLoadingStep("Auditing saved indexes for the current library filters...");
+    try {
+      const formData = new FormData();
+      formData.append("search", pdfSearch.trim());
+      formData.append("batch_filter", batchFilter.trim());
+      formData.append("row_start", String(Math.max(1, parseInt(auditRowStart, 10) || 1)));
+      if ((auditRowEnd || "").trim()) formData.append("row_end", String(Math.max(1, parseInt(auditRowEnd, 10) || 1)));
+      const resp = await apiUpload("/api/index-audit-runner", formData);
+      await fetchQueues();
+      await fetchSavedPdfs(pdfSearch);
+      if (!resp.started && resp.message) setError(resp.message);
+    } catch (err) {
+      setError("Error: " + err.message);
+    } finally {
+      setLoading(false);
+      setLoadingStep("");
+    }
+  };
+
+  const runReviewReindexQueue = async () => {
+    setError("");
+    setLoading(true);
+    setLoadingStep("Reindexing the review queue using saved vectorized page text...");
+    try {
+      const resp = await apiFetch("/api/reindex-review-runner", { method: "POST" });
+      await fetchQueues();
+      await fetchSavedPdfs(pdfSearch);
+      if (!resp.started && resp.message) setError(resp.message);
+    } catch (err) {
+      setError("Error: " + err.message);
+    } finally {
+      setLoading(false);
+      setLoadingStep("");
+    }
+  };
+
   const srcBadge = (src) => {
     if (src === "toc" || src === "toc-image") return "badge-toc";
     if (src === "auto") return "badge-auto";
@@ -1401,6 +1588,8 @@ export default function App() {
 
   const runner = queueSnapshot.runner || {};
   const indexRunner = queueSnapshot.index_runner || {};
+  const auditRunner = queueSnapshot.audit_runner || {};
+  const reindexRunner = queueSnapshot.reindex_runner || {};
   const heartbeatAgeSeconds = runner.heartbeat_ts ? Math.max(0, Math.round(Date.now() / 1000 - runner.heartbeat_ts)) : 0;
   const runnerLooksStuck = Boolean(runner.running && heartbeatAgeSeconds > 90);
   const runnerStopping = Boolean(runner.running && runner.pause_requested);
@@ -1416,6 +1605,7 @@ export default function App() {
   const activeTone = getSavedPdfTone(selectedSavedPdf || {});
   const indexedPdfCount = savedPdfs.filter((item) => getSavedPdfTone(item) === "indexed" || getSavedPdfTone(item) === "staged").length;
   const vectorizedPdfCount = savedPdfs.filter((item) => getSavedPdfTone(item) === "ready").length;
+  const reviewPdfCount = savedPdfs.filter((item) => getSavedPdfTone(item) === "review").length;
 
   const covered = Object.keys(coverageMap).length;
   const applicantName = caseInfo?.plaintiff
@@ -1500,9 +1690,10 @@ export default function App() {
                 <span className="queue-pill">Indexed: {indexedPdfCount}</span>
                 <span className="queue-pill success">Vectorized: {vectorizedPdfCount}</span>
                 <span className="queue-pill">Pending Queue: {(queueSnapshot.pending_vectorization || []).length}</span>
+                <span className="queue-pill warning">Review Queue: {reviewPdfCount}</span>
               </div>
               <div className="library-help subtle">
-                Soft color backgrounds help you spot what is indexed, what still needs vectorization, and what is actively running.
+                Soft color backgrounds help you spot what is indexed, what still needs vectorization, and what has been flagged for index repair.
               </div>
               <div className="saved-pdf-list">
                 {savedPdfs.map((item) => {
@@ -1539,9 +1730,11 @@ export default function App() {
                       <div className="saved-pdf-note">
                         {isDeferredBusy || isIndexBusy
                           ? "This PDF is currently being processed, so deletion is temporarily locked."
-                          : item.pending_pages > 0
-                            ? "Stage 1 is saved. Index is ready, and remaining pages can be vectorized later."
-                            : "This PDF is fully ready in the backend library."}
+                          : item.review_reason
+                            ? `Flagged for review: ${item.review_reason}`
+                            : item.pending_pages > 0
+                              ? "Stage 1 is saved. Index is ready, and remaining pages can be vectorized later."
+                              : "This PDF is fully ready in the backend library."}
                       </div>
                       <div className="saved-pdf-actions">
                         <button className="saved-pdf-open" onClick={() => loadSavedPdf(item.pdf_id)}>
@@ -1851,10 +2044,20 @@ export default function App() {
         runnerStopping={runnerStopping}
         heartbeatAgeSeconds={heartbeatAgeSeconds}
         indexRunner={indexRunner}
+        auditRunner={auditRunner}
+        reindexRunner={reindexRunner}
         loading={loading}
         runAllDeferredQueue={runAllDeferredQueue}
         controlDeferredQueue={controlDeferredQueue}
         forceResetQueue={forceResetQueue}
+        startIndexAudit={startIndexAudit}
+        runReviewReindexQueue={runReviewReindexQueue}
+        auditRowStart={auditRowStart}
+        auditRowEnd={auditRowEnd}
+        setAuditRowStart={setAuditRowStart}
+        setAuditRowEnd={setAuditRowEnd}
+        pdfSearch={pdfSearch}
+        batchFilter={batchFilter}
       />
     </div>
   );

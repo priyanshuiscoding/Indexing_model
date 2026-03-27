@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS pdf_records (
     queue_bucket TEXT NOT NULL DEFAULT 'index',
     deferred_decision TEXT NOT NULL DEFAULT 'pending',
     last_error TEXT NOT NULL DEFAULT '',
+    review_reason TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );

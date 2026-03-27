@@ -52,6 +52,7 @@ from workflow_state import (
     init_db as init_workflow_db,
     list_pdf_records,
     list_pending_pdf_ids,
+    list_reindex_review_pdf_ids,
     replace_extracted_pages,
     save_index,
     update_pdf_record,
@@ -160,6 +161,34 @@ index_runner_status = {
     "started_at": 0.0,
     "finished_pdf_id": "",
     "finished_filename": "",
+    "status": "idle",
+}
+
+audit_runner_lock = Lock()
+audit_runner_status = {
+    "running": False,
+    "processed": 0,
+    "total": 0,
+    "flagged": 0,
+    "current_pdf_id": "",
+    "current_filename": "",
+    "last_error": "",
+    "heartbeat_ts": time.time(),
+    "started_at": 0.0,
+    "status": "idle",
+}
+
+reindex_review_runner_lock = Lock()
+reindex_review_runner_status = {
+    "running": False,
+    "processed": 0,
+    "total": 0,
+    "fixed": 0,
+    "current_pdf_id": "",
+    "current_filename": "",
+    "last_error": "",
+    "heartbeat_ts": time.time(),
+    "started_at": 0.0,
     "status": "idle",
 }
 
@@ -2437,6 +2466,189 @@ def refresh_saved_index_if_needed(
     return payload
 
 
+INDEX_REVIEW_REASON_LABELS = {
+    "missing_saved_index": "Saved index is missing",
+    "stale_index_range_metadata": "Indexed page range does not cover the full PDF",
+    "no_named_sections": "No named index sections were found",
+    "single_section_with_near_total_gap": "Only one named section was found and the rest is a large gap",
+    "gap_dominates_document": "Most of the index is covered by generic gaps",
+    "very_large_gap": "The index contains an unusually large gap range",
+}
+
+
+def format_review_reason(reason_codes: list[str]) -> str:
+    labels = [INDEX_REVIEW_REASON_LABELS.get(code, code.replace("_", " ").strip()) for code in reason_codes if code]
+    labels = list(dict.fromkeys(labels))
+    return "; ".join(labels)[:500]
+
+
+def is_fully_vectorized_record(record: Optional[dict]) -> bool:
+    if not record:
+        return False
+    total_pages = int(record.get("total_pages") or 0)
+    indexed_pages = int(record.get("indexed_pages") or 0)
+    pending_pages = int(record.get("pending_pages") or 0)
+    retrieval_status = (record.get("retrieval_status") or "").strip().lower()
+    return bool(total_pages) and indexed_pages >= total_pages and pending_pages == 0 and retrieval_status == "vectorized"
+
+
+def filter_pdf_records_for_audit(search: str = "", batch_filter: str = "", row_start: int = 1, row_end: Optional[int] = None) -> list[dict]:
+    records = [record for record in list_pdf_records(search) if is_fully_vectorized_record(record)]
+    batch_value = (batch_filter or "").strip().lower()
+    if batch_value:
+        records = [
+            record for record in records
+            if batch_value in str(record.get("cnr_number") or "").lower()
+            or batch_value in str(record.get("filename") or "").lower()
+        ]
+
+    start_index = max(int(row_start or 1), 1) - 1
+    end_index = None if row_end in (None, "", 0, "0") else max(int(row_end), start_index + 1)
+    if start_index >= len(records):
+        return []
+    return records[start_index:end_index]
+
+
+def audit_saved_index_record(pdf_id: str, record: Optional[dict] = None, saved_index: Optional[list[dict]] = None) -> dict:
+    record = record or get_pdf_record(pdf_id)
+    if not is_fully_vectorized_record(record):
+        return {"pdf_id": pdf_id, "eligible": False, "suspicious": False, "reasons": []}
+
+    saved_index = saved_index if saved_index is not None else get_saved_index(pdf_id)
+    suspicious, reason_codes = should_refresh_saved_index(record, saved_index)
+    review_reason = format_review_reason(reason_codes)
+    if suspicious:
+        update_pdf_record(
+            pdf_id,
+            status="needs_review",
+            queue_bucket="reindex_review",
+            review_reason=review_reason,
+            index_ready=True,
+        )
+    else:
+        update_pdf_record(
+            pdf_id,
+            status="vectorized",
+            queue_bucket="library",
+            review_reason="",
+            index_ready=True,
+        )
+
+    return {
+        "pdf_id": pdf_id,
+        "eligible": True,
+        "suspicious": suspicious,
+        "reasons": reason_codes,
+        "review_reason": review_reason,
+    }
+
+
+def run_index_audit_worker(records: list[dict]):
+    audit_runner_status.update({
+        "running": True,
+        "processed": 0,
+        "total": len(records),
+        "flagged": 0,
+        "current_pdf_id": "",
+        "current_filename": "",
+        "last_error": "",
+        "heartbeat_ts": time.time(),
+        "started_at": time.time(),
+        "status": "running",
+    })
+    flagged = 0
+    try:
+        for index, record in enumerate(records, start=1):
+            audit_runner_status.update({
+                "current_pdf_id": record.get("pdf_id", ""),
+                "current_filename": record.get("filename", ""),
+                "processed": index - 1,
+                "heartbeat_ts": time.time(),
+            })
+            try:
+                result = audit_saved_index_record(record["pdf_id"], record=record)
+                if result.get("suspicious"):
+                    flagged += 1
+                    audit_runner_status["flagged"] = flagged
+            except Exception as exc:
+                log.exception("Index audit failed for %s", record.get("pdf_id"))
+                update_pdf_record(record["pdf_id"], last_error=str(exc))
+                audit_runner_status["last_error"] = str(exc)
+            finally:
+                audit_runner_status["processed"] = index
+                audit_runner_status["heartbeat_ts"] = time.time()
+    finally:
+        audit_runner_status.update({
+            "running": False,
+            "current_pdf_id": "",
+            "current_filename": "",
+            "heartbeat_ts": time.time(),
+            "status": "idle",
+        })
+
+
+def run_reindex_review_worker(pdf_ids: list[str]):
+    reindex_review_runner_status.update({
+        "running": True,
+        "processed": 0,
+        "total": len(pdf_ids),
+        "fixed": 0,
+        "current_pdf_id": "",
+        "current_filename": "",
+        "last_error": "",
+        "heartbeat_ts": time.time(),
+        "started_at": time.time(),
+        "status": "running",
+    })
+    fixed = 0
+    try:
+        for index, pdf_id in enumerate(pdf_ids, start=1):
+            record = get_pdf_record(pdf_id) or {}
+            reindex_review_runner_status.update({
+                "current_pdf_id": pdf_id,
+                "current_filename": record.get("filename", ""),
+                "processed": index - 1,
+                "heartbeat_ts": time.time(),
+            })
+            try:
+                payload = generate_index_payload(IndexRequest(pdf_id=pdf_id))
+                refreshed = get_pdf_record(pdf_id) or record
+                total_pages = int(refreshed.get("total_pages") or payload.get("total_pages") or 0)
+                update_pdf_record(
+                    pdf_id,
+                    status="vectorized",
+                    retrieval_status="vectorized",
+                    chat_ready=True,
+                    pending_pages=0,
+                    queue_bucket="library",
+                    deferred_decision="completed",
+                    last_error="",
+                    review_reason="",
+                    index_ready=True,
+                    index_source=payload.get("index_source", refreshed.get("index_source", "auto")),
+                    indexed_pages=max(int(payload.get("indexed_pages") or 0), total_pages),
+                    selected_start_page=1,
+                    selected_end_page=total_pages or int(payload.get("indexed_page_end") or refreshed.get("selected_end_page") or 1),
+                )
+                fixed += 1
+                reindex_review_runner_status["fixed"] = fixed
+            except Exception as exc:
+                log.exception("Reindex review queue failed for %s", pdf_id)
+                update_pdf_record(pdf_id, status="needs_review", queue_bucket="reindex_review", last_error=str(exc))
+                reindex_review_runner_status["last_error"] = str(exc)
+            finally:
+                reindex_review_runner_status["processed"] = index
+                reindex_review_runner_status["heartbeat_ts"] = time.time()
+    finally:
+        reindex_review_runner_status.update({
+            "running": False,
+            "current_pdf_id": "",
+            "current_filename": "",
+            "heartbeat_ts": time.time(),
+            "status": "idle",
+        })
+
+
 def run_stage_one_index_worker(pdf_bytes: bytes, filename: str, start_page: int, end_page: Optional[int], known_pdf_id: str = ""):
     pdf_id = known_pdf_id or pdf_id_from_bytes(pdf_bytes)
     index_runner_status.update({
@@ -3144,16 +3356,19 @@ async def generate_index(req: IndexRequest):
     payload = generate_index_payload(req)
     record = get_pdf_record(req.pdf_id)
     if record:
+        pending_pages = int(record.get("pending_pages", 0) or 0)
+        is_fully_vectorized = pending_pages == 0 and (str(record.get("retrieval_status") or "").lower() == "vectorized" or bool(record.get("chat_ready")))
         update_pdf_record(
             req.pdf_id,
-            status="index_ready",
+            status="index_ready" if pending_pages > 0 else ("vectorized" if is_fully_vectorized else "index_ready"),
             index_ready=True,
             index_source=payload.get("index_source", record.get("index_source", "auto")),
             indexed_pages=payload.get("indexed_pages", record.get("indexed_pages", 0)),
             selected_start_page=payload.get("indexed_page_start", record.get("selected_start_page", 1)),
             selected_end_page=payload.get("indexed_page_end", record.get("selected_end_page", 1)),
-            queue_bucket="deferred" if record.get("pending_pages", 0) > 0 else "library",
-            deferred_decision="pending" if record.get("pending_pages", 0) > 0 else "completed",
+            queue_bucket="deferred" if pending_pages > 0 else "library",
+            deferred_decision="pending" if pending_pages > 0 else "completed",
+            review_reason="" if pending_pages == 0 else record.get("review_reason", ""),
         )
         updated_record = get_pdf_record(req.pdf_id) or record
         payload["status"] = updated_record.get("status", payload.get("status", "index_ready"))
@@ -3270,14 +3485,16 @@ async def get_queues():
         **build_queue_snapshot(),
         "runner": dict(deferred_runner_status),
         "index_runner": dict(index_runner_status),
+        "audit_runner": dict(audit_runner_status),
+        "reindex_runner": dict(reindex_review_runner_status),
     }
 
 
 @app.post("/api/queues/reset")
 async def reset_queue(queue_name: str = Form(...)):
     queue_value = (queue_name or "").strip().lower()
-    if queue_value not in {"index", "deferred"}:
-        raise HTTPException(400, "queue_name must be index or deferred")
+    if queue_value not in {"index", "deferred", "reindex"}:
+        raise HTTPException(400, "queue_name must be index, deferred, or reindex")
 
     reset_count = 0
     for record in list_pdf_records():
@@ -3297,23 +3514,38 @@ async def reset_queue(queue_name: str = Form(...)):
                 queue_bucket="deferred" if pending_pages > 0 else "library",
                 deferred_decision="pending" if pending_pages > 0 else record.get("deferred_decision", "completed"),
                 last_error="",
+                review_reason="" if pending_pages == 0 else record.get("review_reason", ""),
             )
             reset_count += 1
             continue
 
-        should_reset = pending_pages > 0 and (
-            retrieval_status in {"full_ingestion_running", "queued_for_full_ingestion", "pending_deferred_ingestion", "failed"}
-            or status == "full_ingestion_running"
-        )
+        if queue_value == "deferred":
+            should_reset = pending_pages > 0 and (
+                retrieval_status in {"full_ingestion_running", "queued_for_full_ingestion", "pending_deferred_ingestion", "failed"}
+                or status == "full_ingestion_running"
+            )
+            if not should_reset:
+                continue
+            update_pdf_record(
+                record["pdf_id"],
+                status="index_ready" if index_ready else "toc_scanned",
+                retrieval_status="pending_deferred_ingestion",
+                chat_ready=False,
+                queue_bucket="deferred",
+                deferred_decision="queue" if record.get("deferred_decision") == "queue" else "pending",
+                last_error="",
+            )
+            reset_count += 1
+            continue
+
+        should_reset = record.get("queue_bucket") == "reindex_review" or status == "needs_review" or bool(record.get("review_reason"))
         if not should_reset:
             continue
         update_pdf_record(
             record["pdf_id"],
-            status="index_ready" if index_ready else "toc_scanned",
-            retrieval_status="pending_deferred_ingestion",
-            chat_ready=False,
-            queue_bucket="deferred",
-            deferred_decision="queue" if record.get("deferred_decision") == "queue" else "pending",
+            status="vectorized" if is_fully_vectorized_record(record) else status,
+            queue_bucket="library" if is_fully_vectorized_record(record) else record.get("queue_bucket", "library"),
+            review_reason="",
             last_error="",
         )
         reset_count += 1
@@ -3372,7 +3604,14 @@ async def save_pdf_index(pdf_id: str, req: IndexSaveRequest):
 
     normalized_items.sort(key=lambda item: (item.get("pageFrom", 0), item.get("pageTo", 0), item.get("title", "")))
     save_index(pdf_id, normalized_items)
-    update_pdf_record(pdf_id, index_ready=True, index_source="manual")
+    update_pdf_record(
+        pdf_id,
+        index_ready=True,
+        index_source="manual",
+        review_reason="",
+        queue_bucket="library" if int(record.get("pending_pages") or 0) == 0 else record.get("queue_bucket", "library"),
+        status="vectorized" if is_fully_vectorized_record(record) else record.get("status", "index_ready"),
+    )
 
     export_path = export_index_json(
         pdf_id=pdf_id,
@@ -3556,6 +3795,61 @@ async def process_pending_batch():
     for pdf_id in list_pending_pdf_ids():
         results.append(process_pending_pdf_impl(pdf_id))
     return {"processed": results, "count": len(results)}
+
+
+@app.post("/api/index-audit-runner")
+async def start_index_audit_runner(
+    search: str = Form(""),
+    batch_filter: str = Form(""),
+    row_start: int = Form(1),
+    row_end: Optional[int] = Form(None),
+):
+    with audit_runner_lock:
+        if audit_runner_status.get("running"):
+            return {
+                "started": False,
+                "runner": dict(audit_runner_status),
+                "message": "Index audit is already running.",
+            }
+        records = filter_pdf_records_for_audit(search=search, batch_filter=batch_filter, row_start=row_start, row_end=row_end)
+        if not records:
+            return {
+                "started": False,
+                "runner": dict(audit_runner_status),
+                "message": "No fully vectorized PDFs matched the audit filters.",
+            }
+        worker = Thread(target=run_index_audit_worker, args=(records,), daemon=True)
+        worker.start()
+    return {
+        "started": True,
+        "runner": dict(audit_runner_status),
+        "count": len(records),
+    }
+
+
+@app.post("/api/reindex-review-runner")
+async def start_reindex_review_runner():
+    with reindex_review_runner_lock:
+        if reindex_review_runner_status.get("running"):
+            return {
+                "started": False,
+                "runner": dict(reindex_review_runner_status),
+                "message": "Reindex review queue is already running.",
+            }
+        pdf_ids = list_reindex_review_pdf_ids()
+        if not pdf_ids:
+            return {
+                "started": False,
+                "runner": dict(reindex_review_runner_status),
+                "message": "No PDFs are waiting in the reindex review queue.",
+            }
+        worker = Thread(target=run_reindex_review_worker, args=(pdf_ids,), daemon=True)
+        worker.start()
+    return {
+        "started": True,
+        "runner": dict(reindex_review_runner_status),
+        "count": len(pdf_ids),
+    }
 
 
 @app.post("/api/process-pending-runner")
