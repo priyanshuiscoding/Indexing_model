@@ -2433,6 +2433,51 @@ def enqueue_pdf_for_stage1(pdf_bytes: bytes, filename: str, start_page: int = 1,
     }
 
 
+def normalize_background_queue_state():
+    for record in list_pdf_records():
+        pdf_id = record.get("pdf_id")
+        if not pdf_id:
+            continue
+
+        status = str(record.get("status") or "").lower()
+        retrieval_status = str(record.get("retrieval_status") or "").lower()
+        queue_bucket = str(record.get("queue_bucket") or "")
+        pending_pages = int(record.get("pending_pages") or 0)
+        chat_ready = bool(record.get("chat_ready"))
+
+        if pending_pages <= 0 and (chat_ready or retrieval_status == "vectorized" or status == "vectorized"):
+            if queue_bucket != "library" or status != "vectorized" or retrieval_status != "vectorized":
+                update_pdf_record(
+                    pdf_id,
+                    status="vectorized",
+                    retrieval_status="vectorized",
+                    chat_ready=True,
+                    pending_pages=0,
+                    queue_bucket="library",
+                    deferred_decision="completed",
+                )
+            continue
+
+        if queue_bucket == "stage1_batch" and status == "index_ready":
+            update_pdf_record(
+                pdf_id,
+                queue_bucket="deferred",
+                retrieval_status="queued_for_full_ingestion",
+                deferred_decision="pending",
+                last_error="",
+            )
+            continue
+
+        if queue_bucket == "stage1_batch" and (status == "full_ingestion_running" or retrieval_status == "full_ingestion_running"):
+            update_pdf_record(
+                pdf_id,
+                queue_bucket="deferred",
+                status="full_ingestion_running",
+                retrieval_status="full_ingestion_running",
+                deferred_decision="pending",
+            )
+
+
 def process_stage1_batch_pdf_impl(pdf_id: str) -> dict:
     record = get_pdf_record(pdf_id)
     if not record:
@@ -2458,23 +2503,24 @@ def process_stage1_batch_pdf_impl(pdf_id: str) -> dict:
                 last_error="",
             )
             payload = build_stage_one_payload(pdf_path.read_bytes(), filename, start_page=start_page, end_page=end_page)
+            refreshed_record = get_pdf_record(pdf_id) or record
             if int(payload.get("pending_pages") or 0) > 0:
                 update_pdf_record(
                     pdf_id,
                     status="index_ready",
                     retrieval_status="queued_for_full_ingestion",
-                    queue_bucket="stage1_batch",
-                    deferred_decision="queue",
+                    queue_bucket="deferred",
+                    deferred_decision="pending",
                     last_error="",
                 )
-                deferred_resp = process_pending_pdf_impl(pdf_id)
-                refreshed_record = get_pdf_record(pdf_id) or record
+                start_deferred_runner_if_needed()
+                refreshed_record = get_pdf_record(pdf_id) or refreshed_record
                 return {
                     **payload,
-                    "status": refreshed_record.get("status", deferred_resp.get("status", payload.get("status", "vectorized"))),
-                    "retrieval_status": refreshed_record.get("retrieval_status", deferred_resp.get("retrieval_status", payload.get("retrieval_status", "vectorized"))),
-                    "pending_pages": refreshed_record.get("pending_pages", deferred_resp.get("pending_pages", 0)),
-                    "chat_ready": bool(refreshed_record.get("chat_ready", deferred_resp.get("chat_ready", True))),
+                    "status": refreshed_record.get("status", payload.get("status", "index_ready")),
+                    "retrieval_status": refreshed_record.get("retrieval_status", payload.get("retrieval_status", "queued_for_full_ingestion")),
+                    "pending_pages": refreshed_record.get("pending_pages", payload.get("pending_pages", 0)),
+                    "chat_ready": bool(refreshed_record.get("chat_ready", payload.get("chat_ready", False))),
                 }
 
             update_pdf_record(
@@ -3785,7 +3831,7 @@ async def reset_queue(queue_name: str = Form(...)):
             continue
 
         if queue_value == "stage1_batch":
-            should_reset = record.get("queue_bucket") == "stage1_batch" or status in {"queued_for_stage1", "indexing_running", "full_ingestion_running"}
+            should_reset = record.get("queue_bucket") == "stage1_batch" or status in {"queued_for_stage1", "indexing_running"}
             if not should_reset:
                 continue
             update_pdf_record(
@@ -3994,11 +4040,11 @@ def process_pending_pdf_impl(pdf_id: str):
         "index_source": (refreshed_payload or {}).get("index_source", refreshed_record.get("index_source", "auto")),
     }
 
-def run_deferred_queue_worker(pdf_ids: list[str]):
+def run_deferred_queue_worker():
     deferred_runner_status.update({
         "running": True,
         "processed": 0,
-        "total": len(pdf_ids),
+        "total": len(list_pending_pdf_ids()),
         "current_pdf_id": "",
         "current_filename": "",
         "last_error": "",
@@ -4007,7 +4053,7 @@ def run_deferred_queue_worker(pdf_ids: list[str]):
     })
     completed = 0
     try:
-        for index, pdf_id in enumerate(pdf_ids, start=1):
+        while True:
             if deferred_runner_status.get("pause_requested"):
                 deferred_runner_status.update({
                     "paused": True,
@@ -4017,11 +4063,18 @@ def run_deferred_queue_worker(pdf_ids: list[str]):
                     "heartbeat_ts": time.time(),
                 })
                 break
+
+            pending_ids = list_pending_pdf_ids()
+            if not pending_ids:
+                break
+
+            pdf_id = pending_ids[0]
             record = get_pdf_record(pdf_id) or {}
             deferred_runner_status.update({
                 "current_pdf_id": pdf_id,
                 "current_filename": record.get("filename", ""),
                 "processed": completed,
+                "total": completed + len(pending_ids),
                 "heartbeat_ts": time.time(),
             })
             try:
@@ -4034,9 +4087,6 @@ def run_deferred_queue_worker(pdf_ids: list[str]):
                 update_pdf_record(pdf_id, retrieval_status="failed", last_error=str(exc))
                 deferred_runner_status["last_error"] = str(exc)
                 deferred_runner_status["heartbeat_ts"] = time.time()
-        else:
-            deferred_runner_status["processed"] = len(pdf_ids)
-            deferred_runner_status["heartbeat_ts"] = time.time()
     finally:
         deferred_runner_status.update({
             "running": False,
@@ -4130,33 +4180,40 @@ async def start_stage1_batch_background():
     }
 
 
-@app.post("/api/process-pending-runner")
-async def process_pending_background():
+def start_deferred_runner_if_needed(force_resume: bool = False) -> bool:
     with deferred_runner_lock:
         if deferred_runner_status.get("running"):
-            return {
-                "started": False,
-                "runner": dict(deferred_runner_status),
-                "message": "Deferred queue is already running.",
-            }
+            return False
+        if deferred_runner_status.get("paused") and not force_resume:
+            return False
         pdf_ids = list_pending_pdf_ids()
         if not pdf_ids:
-            return {
-                "started": False,
-                "runner": dict(deferred_runner_status),
-                "message": "No PDFs are waiting in the deferred queue.",
-            }
+            return False
         deferred_runner_status.update({
             "pause_requested": False,
             "paused": False,
-            "last_error": deferred_runner_status.get("last_error", ""),
+            "processed": 0,
+            "total": len(pdf_ids),
+            "heartbeat_ts": time.time(),
         })
-        worker = Thread(target=run_deferred_queue_worker, args=(pdf_ids,), daemon=True)
+        worker = Thread(target=run_deferred_queue_worker, daemon=True)
         worker.start()
+        return True
+
+
+@app.post("/api/process-pending-runner")
+async def process_pending_background():
+    started = start_deferred_runner_if_needed(force_resume=True)
+    if not started:
+        return {
+            "started": False,
+            "runner": dict(deferred_runner_status),
+            "message": "No PDFs are waiting in the deferred queue." if not list_pending_pdf_ids() else "Deferred queue is already running.",
+        }
     return {
         "started": True,
         "runner": dict(deferred_runner_status),
-        "count": len(pdf_ids),
+        "count": len(list_pending_pdf_ids()),
     }
 
 
@@ -4166,8 +4223,8 @@ async def control_process_pending_runner(action: str = Form(...)):
     if action_value not in {"stop", "resume"}:
         raise HTTPException(400, "action must be stop or resume")
 
-    with deferred_runner_lock:
-        if action_value == "stop":
+    if action_value == "stop":
+        with deferred_runner_lock:
             if deferred_runner_status.get("running"):
                 deferred_runner_status.update({
                     "pause_requested": True,
@@ -4190,6 +4247,7 @@ async def control_process_pending_runner(action: str = Form(...)):
                 "runner": dict(deferred_runner_status),
             }
 
+    with deferred_runner_lock:
         if deferred_runner_status.get("running"):
             return {
                 "accepted": False,
@@ -4204,20 +4262,13 @@ async def control_process_pending_runner(action: str = Form(...)):
                 "message": "No PDFs are waiting in the deferred queue.",
                 "runner": dict(deferred_runner_status),
             }
-        deferred_runner_status.update({
-            "pause_requested": False,
-            "paused": False,
-            "processed": 0,
-            "total": len(pdf_ids),
-            "heartbeat_ts": time.time(),
-        })
-        worker = Thread(target=run_deferred_queue_worker, args=(pdf_ids,), daemon=True)
-        worker.start()
-        return {
-            "accepted": True,
-            "message": "Deferred queue resumed.",
-            "runner": dict(deferred_runner_status),
-        }
+
+    started = start_deferred_runner_if_needed(force_resume=True)
+    return {
+        "accepted": bool(started),
+        "message": "Deferred queue resumed." if started else "Deferred queue is already running.",
+        "runner": dict(deferred_runner_status),
+    }
 
 
 # -- 6. DELETE PDF ─────────────────────────────────────────────────────────────
@@ -4287,7 +4338,9 @@ Return only the transliterated text."""
 @app.on_event("startup")
 async def startup():
     init_workflow_db()
+    normalize_background_queue_state()
     resumed_stage1 = start_stage1_batch_runner_if_needed()
+    resumed_deferred = start_deferred_runner_if_needed(force_resume=True)
     if not LOCAL_TEXT_MODEL:
         log.warning("LOCAL_TEXT_MODEL is not set - AI features will fail")
     log.info(f"Local LLM URL: {LOCAL_LLM_BASE_URL}")
@@ -4305,4 +4358,6 @@ async def startup():
     await asyncio.to_thread(get_embedder)
     if resumed_stage1:
         log.info("Resumed Stage 1 batch queue on startup")
+    if resumed_deferred:
+        log.info("Resumed deferred queue on startup")
     log.info("Server ready")

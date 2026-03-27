@@ -72,6 +72,51 @@ const apiUpload = async (path, formData) => {
   }
 };
 
+const describeSavedPdfStatus = (item = {}, flags = {}) => {
+  const status = (item.status || "").toLowerCase();
+  const retrieval = (item.retrieval_status || "").toLowerCase();
+  const pending = Number(item.pending_pages || 0);
+
+  if (flags.isDeferredBusy) {
+    return "Full ingestion and vectorization are running for this PDF.";
+  }
+  if (flags.isIndexBusy || flags.isStage1BatchBusy || status === "indexing_running") {
+    return "Stage 1 indexing is running in the background for this PDF.";
+  }
+  if (item.review_reason) {
+    return `Flagged for review: ${item.review_reason}`;
+  }
+  if (status === "queued_for_stage1" || item.queue_bucket === "stage1_batch") {
+    return "Uploaded and queued for Stage 1 indexing. The backend will continue even if you close the browser.";
+  }
+  if ((retrieval === "full_ingestion_running" || status === "full_ingestion_running") && pending > 0) {
+    return "Stage 1 index is ready. Full ingestion and vectorization are now running.";
+  }
+  if (status === "index_ready" && pending > 0 && retrieval === "queued_for_full_ingestion") {
+    return "Stage 1 index is ready. Remaining pages are queued for full ingestion.";
+  }
+  if (status === "index_ready" && pending > 0) {
+    return "Stage 1 index is ready. Remaining pages can now be vectorized from the deferred queue.";
+  }
+  if (pending > 0) {
+    return "Stage 1 index is ready. Remaining pages are still pending vectorization.";
+  }
+  return "This PDF is fully ready in the backend library.";
+};
+
+const formatSavedPdfStatus = (item = {}) => {
+  const status = (item.status || "").toLowerCase();
+  const retrieval = (item.retrieval_status || "").toLowerCase();
+
+  if (status === "queued_for_stage1") return "Queued for Stage 1";
+  if (status === "indexing_running") return "Stage 1 Running";
+  if (status === "index_ready") return retrieval === "queued_for_full_ingestion" ? "Index Ready, Deferred Queued" : "Index Ready";
+  if (status === "full_ingestion_running" || retrieval === "full_ingestion_running") return "Full Ingestion Running";
+  if (status === "vectorized" || retrieval === "vectorized") return "Vectorized";
+  if (status === "failed" || retrieval === "failed") return "Failed";
+  return item.status || "Unknown";
+};
+
 const apiFetchBlob = async (path, opts = {}) => {
   try {
     const resp = await fetch(API + path, opts);
@@ -1167,13 +1212,17 @@ export default function App() {
   }, []);
 
   const jumpToIndexView = useCallback(async (targetPdfId = "") => {
+    const targetRecord = savedPdfs.find((item) => item.pdf_id === (targetPdfId || pdfId));
     if (targetPdfId && targetPdfId !== pdfId) {
       await loadSavedPdf(targetPdfId);
+    }
+    if (targetRecord && !targetRecord.index_ready) {
+      setError("Index is not ready yet for this PDF. It is still queued for Stage 1 indexing.");
     }
     setTab("index");
     setShowQueueModal(false);
     window.setTimeout(() => spotlightIndexSection(), 120);
-  }, [loadSavedPdf, pdfId, spotlightIndexSection]);
+  }, [loadSavedPdf, pdfId, savedPdfs, spotlightIndexSection]);
 
   useEffect(() => {
     fetchSavedPdfs();
@@ -1770,20 +1819,12 @@ export default function App() {
                       </div>
                       <div className="saved-pdf-meta">{item.filename} ? {item.total_pages || 0} pages</div>
                       <div className="saved-pdf-tags">
-                        <span>status: {item.status}</span>
+                        <span>status: {formatSavedPdfStatus(item)}</span>
                         <span>retrieval: {item.retrieval_status}</span>
                         <span>pending: {item.pending_pages || 0}</span>
                       </div>
                       <div className="saved-pdf-note">
-                        {isDeferredBusy || isIndexBusy || isStage1BatchBusy
-                          ? "This PDF is currently being processed, so deletion is temporarily locked."
-                          : item.review_reason
-                            ? `Flagged for review: ${item.review_reason}`
-                            : item.queue_bucket === "stage1_batch" || item.status === "queued_for_stage1"
-                              ? "Queued for overnight Stage 1 indexing. The backend will continue even if you close the browser."
-                              : item.pending_pages > 0
-                                ? "Stage 1 is saved. Index is ready, and remaining pages can be vectorized later."
-                                : "This PDF is fully ready in the backend library."}
+                        {describeSavedPdfStatus(item, { isDeferredBusy, isIndexBusy, isStage1BatchBusy })}
                       </div>
                       <div className="saved-pdf-actions">
                         <button className="saved-pdf-open" onClick={() => loadSavedPdf(item.pdf_id)}>

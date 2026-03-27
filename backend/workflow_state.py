@@ -526,13 +526,27 @@ def list_pending_pdf_ids() -> list[str]:
         if _is_postgres():
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT pdf_id FROM pdf_records WHERE pending_pages > 0 AND deferred_decision != %s ORDER BY updated_at ASC",
-                    ("skip",),
+                    """
+                    SELECT pdf_id
+                    FROM pdf_records
+                    WHERE pending_pages > 0
+                      AND deferred_decision != %s
+                      AND queue_bucket != %s
+                    ORDER BY updated_at ASC
+                    """,
+                    ("skip", "stage1_batch"),
                 )
                 rows = cur.fetchall()
         else:
             rows = conn.execute(
-                "SELECT pdf_id FROM pdf_records WHERE pending_pages > 0 AND deferred_decision != 'skip' ORDER BY updated_at ASC"
+                """
+                SELECT pdf_id
+                FROM pdf_records
+                WHERE pending_pages > 0
+                  AND deferred_decision != 'skip'
+                  AND queue_bucket != 'stage1_batch'
+                ORDER BY updated_at ASC
+                """
             ).fetchall()
         return [row["pdf_id"] for row in rows]
     finally:
@@ -568,10 +582,10 @@ def list_stage1_batch_pdf_ids() -> list[str]:
                     SELECT pdf_id
                     FROM pdf_records
                     WHERE queue_bucket = %s
-                      AND status IN (%s, %s, %s, %s)
+                      AND status IN (%s, %s)
                     ORDER BY updated_at ASC
                     """,
-                    ("stage1_batch", "queued_for_stage1", "indexing_running", "index_ready", "full_ingestion_running"),
+                    ("stage1_batch", "queued_for_stage1", "indexing_running"),
                 )
                 rows = cur.fetchall()
         else:
@@ -580,7 +594,7 @@ def list_stage1_batch_pdf_ids() -> list[str]:
                 SELECT pdf_id
                 FROM pdf_records
                 WHERE queue_bucket = 'stage1_batch'
-                  AND status IN ('queued_for_stage1', 'indexing_running', 'index_ready', 'full_ingestion_running')
+                  AND status IN ('queued_for_stage1', 'indexing_running')
                 ORDER BY updated_at ASC
                 """
             ).fetchall()
