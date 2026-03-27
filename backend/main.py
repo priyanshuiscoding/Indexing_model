@@ -2196,6 +2196,10 @@ def build_existing_pdf_payload(pdf_id: str, filename_override: str = "") -> Opti
     if not record or not pdf_path.exists():
         return None
     saved_index = get_saved_index(pdf_id)
+    refreshed = refresh_saved_index_if_needed(pdf_id, record=record, saved_index=saved_index, reason="loading saved PDF")
+    if refreshed:
+        record = get_pdf_record(pdf_id) or record
+        saved_index = refreshed.get("index", saved_index)
     return {
         "pdf_id": pdf_id,
         "cnr_number": record.get("cnr_number") or cnr_number_from_filename(filename_override or record.get("filename") or ""),
@@ -2328,6 +2332,109 @@ async def build_stage_one_payload_async(pdf_bytes: bytes, filename: str, start_p
 
 def build_stage_one_payload(pdf_bytes: bytes, filename: str, start_page: int = 1, end_page: Optional[int] = None) -> dict:
     return asyncio.run(build_stage_one_payload_async(pdf_bytes, filename, start_page=start_page, end_page=end_page))
+
+
+def analyze_saved_index_health(index_items: list[dict], total_pages: int) -> dict:
+    gap_items = [item for item in index_items if item.get("source") == "gap"]
+    non_gap_items = [item for item in index_items if item.get("source") != "gap"]
+    gap_pages = sum(
+        max(0, coerce_page_number(item.get("pageTo"), 0) - coerce_page_number(item.get("pageFrom"), 0) + 1)
+        for item in gap_items
+    )
+    largest_gap = max(
+        (
+            max(0, coerce_page_number(item.get("pageTo"), 0) - coerce_page_number(item.get("pageFrom"), 0) + 1)
+            for item in gap_items
+        ),
+        default=0,
+    )
+
+    reasons = []
+    if total_pages >= 20 and not non_gap_items:
+        reasons.append("no_named_sections")
+    if total_pages >= 20 and len(non_gap_items) <= 1 and gap_pages >= max(total_pages - 1, 1):
+        reasons.append("single_section_with_near_total_gap")
+    if total_pages >= 30 and len(non_gap_items) <= 2 and gap_pages / max(total_pages, 1) >= 0.80:
+        reasons.append("gap_dominates_document")
+    if total_pages >= 30 and largest_gap / max(total_pages, 1) >= 0.75:
+        reasons.append("very_large_gap")
+
+    return {
+        "suspicious": bool(reasons),
+        "reasons": reasons,
+    }
+
+
+def should_refresh_saved_index(record: Optional[dict], saved_index: list[dict]) -> tuple[bool, list[str]]:
+    if not record:
+        return False, []
+
+    total_pages = int(record.get("total_pages") or 0)
+    indexed_pages = int(record.get("indexed_pages") or 0)
+    pending_pages = int(record.get("pending_pages") or 0)
+    retrieval_status = (record.get("retrieval_status") or "").strip().lower()
+    fully_vectorized = bool(total_pages) and indexed_pages >= total_pages and pending_pages == 0 and retrieval_status == "vectorized"
+    if not fully_vectorized:
+        return False, []
+
+    reasons = []
+    if not saved_index:
+        reasons.append("missing_saved_index")
+
+    selected_start_page = int(record.get("selected_start_page") or 1)
+    selected_end_page = int(record.get("selected_end_page") or 0)
+    if selected_start_page != 1 or selected_end_page < total_pages:
+        reasons.append("stale_index_range_metadata")
+
+    if saved_index:
+        health = analyze_saved_index_health(saved_index, total_pages)
+        if health["suspicious"]:
+            reasons.extend(health["reasons"])
+
+    reasons = list(dict.fromkeys(reasons))
+    return bool(reasons), reasons
+
+
+def refresh_saved_index_if_needed(
+    pdf_id: str,
+    record: Optional[dict] = None,
+    saved_index: Optional[list[dict]] = None,
+    reason: str = "",
+) -> Optional[dict]:
+    record = record or get_pdf_record(pdf_id)
+    if not record:
+        return None
+
+    saved_index = saved_index if saved_index is not None else get_saved_index(pdf_id)
+    needs_refresh, reasons = should_refresh_saved_index(record, saved_index)
+    if not needs_refresh:
+        return None
+
+    log.info(
+        "Refreshing saved index for %s after %s because %s",
+        pdf_id,
+        reason or "validation",
+        ", ".join(reasons),
+    )
+    payload = generate_index_payload(IndexRequest(pdf_id=pdf_id))
+    refreshed_record = get_pdf_record(pdf_id) or record
+    total_pages = int(refreshed_record.get("total_pages") or payload.get("total_pages") or 0)
+    update_pdf_record(
+        pdf_id,
+        status="vectorized",
+        retrieval_status="vectorized",
+        chat_ready=True,
+        pending_pages=0,
+        queue_bucket="library",
+        deferred_decision="completed",
+        last_error="",
+        index_ready=True,
+        index_source=payload.get("index_source", refreshed_record.get("index_source", "auto")),
+        indexed_pages=max(int(payload.get("indexed_pages") or 0), total_pages),
+        selected_start_page=1,
+        selected_end_page=total_pages or int(payload.get("indexed_page_end") or refreshed_record.get("selected_end_page") or 1),
+    )
+    return payload
 
 
 def run_stage_one_index_worker(pdf_bytes: bytes, filename: str, start_page: int, end_page: Optional[int], known_pdf_id: str = ""):
@@ -2580,14 +2687,13 @@ If the current page appears relevant, prioritize that page and its nearby pages.
 
 
 # -- 3. GENERATE INDEX ─────────────────────────────────────────────────────────
-@app.post("/api/generate-index")
-async def generate_index(req: IndexRequest):
+def generate_index_payload(req: IndexRequest, timing_collector: Optional[PdfTimingCollector] = None) -> dict:
     """
     Generate the structured document index from cached Stage 1 pages first.
     If a TOC is detected, ranges are expanded deterministically across the whole PDF.
     """
     record = get_pdf_record(req.pdf_id)
-    timing_collector = PdfTimingCollector(req.pdf_id, (record or {}).get("filename", ""))
+    timing_collector = timing_collector or PdfTimingCollector(req.pdf_id, (record or {}).get("filename", ""))
     all_pages = load_index_pages(req.pdf_id)
     if not all_pages:
         raise HTTPException(404, f"PDF {req.pdf_id} not found. Please ingest first.")
@@ -3031,6 +3137,31 @@ Return ONLY a valid JSON array (empty [] if nothing found):
         "index_export_file": str(export_path),
     }
 
+
+
+@app.post("/api/generate-index")
+async def generate_index(req: IndexRequest):
+    payload = generate_index_payload(req)
+    record = get_pdf_record(req.pdf_id)
+    if record:
+        update_pdf_record(
+            req.pdf_id,
+            status="index_ready",
+            index_ready=True,
+            index_source=payload.get("index_source", record.get("index_source", "auto")),
+            indexed_pages=payload.get("indexed_pages", record.get("indexed_pages", 0)),
+            selected_start_page=payload.get("indexed_page_start", record.get("selected_start_page", 1)),
+            selected_end_page=payload.get("indexed_page_end", record.get("selected_end_page", 1)),
+            queue_bucket="deferred" if record.get("pending_pages", 0) > 0 else "library",
+            deferred_decision="pending" if record.get("pending_pages", 0) > 0 else "completed",
+        )
+        updated_record = get_pdf_record(req.pdf_id) or record
+        payload["status"] = updated_record.get("status", payload.get("status", "index_ready"))
+        payload["retrieval_status"] = updated_record.get("retrieval_status", payload.get("retrieval_status", "legacy"))
+        payload["pending_pages"] = updated_record.get("pending_pages", payload.get("pending_pages", 0))
+        payload["chat_ready"] = bool(updated_record.get("chat_ready", payload.get("chat_ready", True)))
+    return payload
+
 # -- 4. GET PAGE TEXT ──────────────────────────────────────────────────────────
 @app.get("/api/page-text/{pdf_id}/{page_num}")
 async def get_page_text(pdf_id: str, page_num: int):
@@ -3199,9 +3330,14 @@ async def get_pdf_details(pdf_id: str):
     record = get_pdf_record(pdf_id)
     if not record:
         raise HTTPException(404, f"PDF {pdf_id} not found")
+    saved_index = get_saved_index(pdf_id)
+    refreshed = refresh_saved_index_if_needed(pdf_id, record=record, saved_index=saved_index, reason="loading pdf details")
+    if refreshed:
+        record = get_pdf_record(pdf_id) or record
+        saved_index = refreshed.get("index", saved_index)
     return {
         "pdf": record,
-        "index": get_saved_index(pdf_id),
+        "index": saved_index,
     }
 
 
@@ -3337,19 +3473,24 @@ def process_pending_pdf_impl(pdf_id: str):
         last_error="",
     )
 
+    refreshed_record = get_pdf_record(pdf_id)
+    refreshed_payload = refresh_saved_index_if_needed(pdf_id, record=refreshed_record, reason="deferred ingestion")
+    refreshed_record = get_pdf_record(pdf_id) or refreshed_record or record
+
     timing_collector.log_summary("deferred_vectorization")
 
     return {
         "pdf_id": pdf_id,
-        "status": "vectorized",
-        "retrieval_status": "vectorized",
-        "pending_pages": 0,
+        "status": refreshed_record.get("status", "vectorized"),
+        "retrieval_status": refreshed_record.get("retrieval_status", "vectorized"),
+        "pending_pages": refreshed_record.get("pending_pages", 0),
         "processed_pages": len(pages_data),
-        "indexed_pages": updated_indexed_pages,
+        "indexed_pages": refreshed_record.get("indexed_pages", updated_indexed_pages),
         "ocr_pages": stats["ocr_pages"],
         "vision_ocr_pages": stats["vision_ocr_pages"],
         "handwriting_suspected_pages": stats["handwriting_suspected_pages"],
-        "chat_ready": True,
+        "chat_ready": bool(refreshed_record.get("chat_ready", True)),
+        "index_source": (refreshed_payload or {}).get("index_source", refreshed_record.get("index_source", "auto")),
     }
 
 def run_deferred_queue_worker(pdf_ids: list[str]):
