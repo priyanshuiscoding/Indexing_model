@@ -558,11 +558,43 @@ def list_reindex_review_pdf_ids() -> list[str]:
         conn.close()
 
 
+def list_stage1_batch_pdf_ids() -> list[str]:
+    conn = get_connection()
+    try:
+        if _is_postgres():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT pdf_id
+                    FROM pdf_records
+                    WHERE queue_bucket = %s
+                      AND status IN (%s, %s, %s, %s)
+                    ORDER BY updated_at ASC
+                    """,
+                    ("stage1_batch", "queued_for_stage1", "indexing_running", "index_ready", "full_ingestion_running"),
+                )
+                rows = cur.fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT pdf_id
+                FROM pdf_records
+                WHERE queue_bucket = 'stage1_batch'
+                  AND status IN ('queued_for_stage1', 'indexing_running', 'index_ready', 'full_ingestion_running')
+                ORDER BY updated_at ASC
+                """
+            ).fetchall()
+        return [row["pdf_id"] for row in rows]
+    finally:
+        conn.close()
+
+
 def build_queue_snapshot() -> dict:
     records = list_pdf_records()
     return {
         "index_ready": [record for record in records if record.get("index_ready")],
-        "pending_vectorization": [record for record in records if record.get("pending_pages", 0) > 0],
+        "stage1_batch": [record for record in records if record.get("queue_bucket") == "stage1_batch"],
+        "pending_vectorization": [record for record in records if record.get("pending_pages", 0) > 0 and record.get("queue_bucket") != "stage1_batch"],
         "vectorized": [record for record in records if record.get("chat_ready")],
         "reindex_review": [record for record in records if record.get("queue_bucket") == "reindex_review"],
         "errors": [record for record in records if record.get("last_error")],

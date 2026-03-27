@@ -4,21 +4,24 @@ import { documentCatalog } from "./documentCatalog";
 
 const API = process.env.REACT_APP_API_BASE || "";
 const SAVED_PDF_MEMORY_CACHE_LIMIT = 8;
+const BATCH_UPLOAD_CHUNK_SIZE = 20;
 const EMPTY_QUEUE_SNAPSHOT = {
   index_ready: [],
+  stage1_batch: [],
   pending_vectorization: [],
   vectorized: [],
   reindex_review: [],
   errors: [],
   runner: { running: false, processed: 0, total: 0, current_pdf_id: "", current_filename: "", last_error: "", pause_requested: false, paused: false, heartbeat_ts: 0 },
   index_runner: { running: false, current_pdf_id: "", current_filename: "", last_error: "", finished_pdf_id: "", finished_filename: "", status: "idle" },
+  stage1_batch_runner: { running: false, processed: 0, total: 0, current_pdf_id: "", current_filename: "", last_error: "", heartbeat_ts: 0, status: "idle" },
   audit_runner: { running: false, processed: 0, total: 0, flagged: 0, current_pdf_id: "", current_filename: "", last_error: "", heartbeat_ts: 0, status: "idle" },
   reindex_runner: { running: false, processed: 0, total: 0, fixed: 0, current_pdf_id: "", current_filename: "", last_error: "", heartbeat_ts: 0, status: "idle" },
 };
 
 const getFetchErrorMessage = (err) => {
   if (err instanceof TypeError && /fetch/i.test(err.message)) {
-    return "Cannot reach the backend at http://localhost:8000. Start the FastAPI server and try again.";
+    return `Cannot reach the backend. Check the server, proxy, and backend logs${API ? ` at ${API}` : ""}.`;
   }
   return err.message || "Request failed";
 };
@@ -339,6 +342,7 @@ function QueueStatusModal({
   runnerStopping,
   heartbeatAgeSeconds,
   indexRunner,
+  stage1BatchRunner,
   auditRunner,
   reindexRunner,
   loading,
@@ -357,6 +361,7 @@ function QueueStatusModal({
   if (!open) return null;
 
   const reviewQueueCount = (queueSnapshot.reindex_review || []).length;
+  const stage1QueueCount = (queueSnapshot.stage1_batch || []).length;
   const auditHeartbeatAgeSeconds = auditRunner?.heartbeat_ts ? Math.max(0, Math.round(Date.now() / 1000 - auditRunner.heartbeat_ts)) : 0;
   const reindexHeartbeatAgeSeconds = reindexRunner?.heartbeat_ts ? Math.max(0, Math.round(Date.now() / 1000 - reindexRunner.heartbeat_ts)) : 0;
 
@@ -372,6 +377,7 @@ function QueueStatusModal({
         </div>
         <div className="queue-toolbar">
           <span className="queue-pill">Index queue: {savedPdfs.filter((item) => !item.index_ready).length}</span>
+          <span className="queue-pill">Stage 1 batch queue: {stage1QueueCount}</span>
           <span className="queue-pill">Deferred queue: {(queueSnapshot.pending_vectorization || []).length}</span>
           <span className="queue-pill warning">Review queue: {reviewQueueCount}</span>
           {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused) && (
@@ -379,6 +385,9 @@ function QueueStatusModal({
           )}
           {indexRunner.running && (
             <span className="queue-pill success">Indexing: {indexRunner.current_filename || indexRunner.current_pdf_id || "Stage 1 running"}</span>
+          )}
+          {stage1BatchRunner.running && (
+            <span className="queue-pill success">Overnight Stage 1: {stage1BatchRunner.processed || 0}/{stage1BatchRunner.total || 0}</span>
           )}
           {auditRunner.running && (
             <span className="queue-pill warning">Audit: {auditRunner.processed || 0}/{auditRunner.total || 0} - flagged {auditRunner.flagged || 0}</span>
@@ -421,10 +430,11 @@ function QueueStatusModal({
           <button className="queue-resume-btn" onClick={() => controlDeferredQueue("resume")} disabled={loading || !queueSnapshot.runner?.paused || queueSnapshot.runner?.running}>Resume Queue</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("index")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Index Queue</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("deferred")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Deferred Queue</button>
+          <button className="queue-reset-btn" onClick={() => forceResetQueue("stage1_batch")} disabled={loading || stage1BatchRunner.running}>Force Reset Stage 1 Batch Queue</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("reindex")} disabled={loading || reindexRunner.running}>Clear Review Queue</button>
         </div>
         <div className="library-help">
-          Deferred processing fills missing page text and vectors. The review queue is separate and only repairs bad saved indexes from already vectorized PDFs.
+          Chunked batch upload feeds the overnight Stage 1 queue, which then auto-chains into full ingestion. The review queue is separate and only repairs bad saved indexes from already vectorized PDFs.
         </div>
         <div className="runner-panel compact">
           <div className="runner-panel-header">
@@ -458,6 +468,31 @@ function QueueStatusModal({
                         ? "Queue is active. You can keep working in the UI while it continues."
                         : "Start the deferred queue when you want to vectorize all pending PDFs."}
               </div>
+            </div>
+          </div>
+        </div>
+        <div className="runner-panel compact">
+          <div className="runner-panel-header">
+            <span className={`runner-state ${stage1BatchRunner.running ? "running" : "idle"}`}>{stage1BatchRunner.running ? "Stage 1 Batch Running" : "Stage 1 Batch Idle"}</span>
+            <span className="runner-meta">Processed {stage1BatchRunner.processed || 0} of {stage1BatchRunner.total || 0}</span>
+            {stage1BatchRunner.heartbeat_ts ? <span className="runner-meta">Last update {Math.max(0, Math.round(Date.now() / 1000 - stage1BatchRunner.heartbeat_ts))}s ago</span> : null}
+          </div>
+          <div className="runner-grid compact">
+            <div>
+              <div className="runner-label">Current PDF</div>
+              <div className="runner-value">{stage1BatchRunner.current_filename || stage1BatchRunner.current_pdf_id || "None"}</div>
+            </div>
+            <div>
+              <div className="runner-label">Queue State</div>
+              <div className="runner-value">{stage1BatchRunner.running ? "Chunked batch queue is processing in backend and auto-chaining into full ingestion." : "No overnight Stage 1 batch queue is running."}</div>
+            </div>
+            <div>
+              <div className="runner-label">Last Error</div>
+              <div className={`runner-value ${stage1BatchRunner.last_error ? "error" : "muted"}`}>{stage1BatchRunner.last_error || "No recent error"}</div>
+            </div>
+            <div>
+              <div className="runner-label">Operator Hint</div>
+              <div className="runner-value muted">Upload large batches in chunks and let the backend continue even after the browser tab is closed.</div>
             </div>
           </div>
         </div>
@@ -1215,17 +1250,26 @@ export default function App() {
     if (!files.length) return;
     setError("");
     setLoading(true);
-    setLoadingStep(`Uploading ${files.length} PDFs, scanning pages 1-10, and saving Stage 1 indexes...`);
     try {
-      const formData = new FormData();
-      files.forEach((file) => formData.append("files", file));
-      formData.append("start_page", "1");
-      formData.append("end_page", "10");
-      const resp = await apiUpload("/api/ingest-batch", formData);
+      let firstQueuedPdfId = "";
+      for (let idx = 0; idx < files.length; idx += BATCH_UPLOAD_CHUNK_SIZE) {
+        const chunk = files.slice(idx, idx + BATCH_UPLOAD_CHUNK_SIZE);
+        setLoadingStep(`Queueing PDFs ${idx + 1}-${Math.min(files.length, idx + chunk.length)} of ${files.length} for overnight indexing...`);
+        const formData = new FormData();
+        chunk.forEach((file) => formData.append("files", file));
+        formData.append("start_page", "1");
+        formData.append("end_page", "10");
+        const resp = await apiUpload("/api/stage1-batch/enqueue", formData);
+        if (!firstQueuedPdfId) {
+          const firstQueued = (resp.pdfs || []).find((item) => item.pdf_id && !item.skipped_duplicate);
+          firstQueuedPdfId = firstQueued?.pdf_id || "";
+        }
+        await fetchQueues();
+      }
       await fetchSavedPdfs(pdfSearch);
-      const firstReady = (resp.pdfs || []).find((item) => item.pdf_id);
-      if (firstReady?.pdf_id) {
-        await loadSavedPdf(firstReady.pdf_id);
+      await fetchQueues();
+      if (firstQueuedPdfId) {
+        await loadSavedPdf(firstQueuedPdfId);
       }
     } catch (err) {
       console.error(err);
@@ -1588,6 +1632,7 @@ export default function App() {
 
   const runner = queueSnapshot.runner || {};
   const indexRunner = queueSnapshot.index_runner || {};
+  const stage1BatchRunner = queueSnapshot.stage1_batch_runner || {};
   const auditRunner = queueSnapshot.audit_runner || {};
   const reindexRunner = queueSnapshot.reindex_runner || {};
   const heartbeatAgeSeconds = runner.heartbeat_ts ? Math.max(0, Math.round(Date.now() / 1000 - runner.heartbeat_ts)) : 0;
@@ -1681,7 +1726,7 @@ export default function App() {
                 <div className="library-head-actions">
                   <button className="queue-launch-btn" onClick={() => setShowQueueModal(true)}>
                     Queue And Live Status
-                    {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused || indexRunner.running) && <span className="queue-launch-dot" />}
+                    {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused || indexRunner.running || stage1BatchRunner.running) && <span className="queue-launch-dot" />}
                   </button>
                   <div className="section-count">{savedPdfs.length} saved PDFs</div>
                 </div>
@@ -1689,6 +1734,7 @@ export default function App() {
               <div className="library-summary-strip">
                 <span className="queue-pill">Indexed: {indexedPdfCount}</span>
                 <span className="queue-pill success">Vectorized: {vectorizedPdfCount}</span>
+                <span className="queue-pill">Stage 1 Batch: {(queueSnapshot.stage1_batch || []).length}</span>
                 <span className="queue-pill">Pending Queue: {(queueSnapshot.pending_vectorization || []).length}</span>
                 <span className="queue-pill warning">Review Queue: {reviewPdfCount}</span>
               </div>
@@ -1699,7 +1745,8 @@ export default function App() {
                 {savedPdfs.map((item) => {
                   const isDeferredBusy = queueSnapshot.runner?.running && queueSnapshot.runner?.current_pdf_id === item.pdf_id;
                   const isIndexBusy = queueSnapshot.index_runner?.running && queueSnapshot.index_runner?.current_pdf_id === item.pdf_id;
-                  const deleteDisabled = loading || isDeferredBusy || isIndexBusy;
+                  const isStage1BatchBusy = queueSnapshot.stage1_batch_runner?.running && queueSnapshot.stage1_batch_runner?.current_pdf_id === item.pdf_id;
+                  const deleteDisabled = loading || isDeferredBusy || isIndexBusy || isStage1BatchBusy;
                   const cardTone = getSavedPdfTone(item);
                   return (
                     <div
@@ -1728,13 +1775,15 @@ export default function App() {
                         <span>pending: {item.pending_pages || 0}</span>
                       </div>
                       <div className="saved-pdf-note">
-                        {isDeferredBusy || isIndexBusy
+                        {isDeferredBusy || isIndexBusy || isStage1BatchBusy
                           ? "This PDF is currently being processed, so deletion is temporarily locked."
                           : item.review_reason
                             ? `Flagged for review: ${item.review_reason}`
-                            : item.pending_pages > 0
-                              ? "Stage 1 is saved. Index is ready, and remaining pages can be vectorized later."
-                              : "This PDF is fully ready in the backend library."}
+                            : item.queue_bucket === "stage1_batch" || item.status === "queued_for_stage1"
+                              ? "Queued for overnight Stage 1 indexing. The backend will continue even if you close the browser."
+                              : item.pending_pages > 0
+                                ? "Stage 1 is saved. Index is ready, and remaining pages can be vectorized later."
+                                : "This PDF is fully ready in the backend library."}
                       </div>
                       <div className="saved-pdf-actions">
                         <button className="saved-pdf-open" onClick={() => loadSavedPdf(item.pdf_id)}>
@@ -2044,6 +2093,7 @@ export default function App() {
         runnerStopping={runnerStopping}
         heartbeatAgeSeconds={heartbeatAgeSeconds}
         indexRunner={indexRunner}
+        stage1BatchRunner={stage1BatchRunner}
         auditRunner={auditRunner}
         reindexRunner={reindexRunner}
         loading={loading}

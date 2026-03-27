@@ -53,6 +53,7 @@ from workflow_state import (
     list_pdf_records,
     list_pending_pdf_ids,
     list_reindex_review_pdf_ids,
+    list_stage1_batch_pdf_ids,
     replace_extracted_pages,
     save_index,
     update_pdf_record,
@@ -161,6 +162,19 @@ index_runner_status = {
     "started_at": 0.0,
     "finished_pdf_id": "",
     "finished_filename": "",
+    "status": "idle",
+}
+
+stage1_batch_runner_lock = Lock()
+stage1_batch_runner_status = {
+    "running": False,
+    "processed": 0,
+    "total": 0,
+    "current_pdf_id": "",
+    "current_filename": "",
+    "last_error": "",
+    "heartbeat_ts": time.time(),
+    "started_at": 0.0,
     "status": "idle",
 }
 
@@ -2363,6 +2377,202 @@ def build_stage_one_payload(pdf_bytes: bytes, filename: str, start_page: int = 1
     return asyncio.run(build_stage_one_payload_async(pdf_bytes, filename, start_page=start_page, end_page=end_page))
 
 
+def enqueue_pdf_for_stage1(pdf_bytes: bytes, filename: str, start_page: int = 1, end_page: Optional[int] = None) -> dict:
+    pdf_id = pdf_id_from_bytes(pdf_bytes)
+    existing = build_existing_pdf_payload(pdf_id, filename)
+    if existing:
+        return {
+            "pdf_id": pdf_id,
+            "filename": existing.get("filename") or filename,
+            "status": "skipped",
+            "skipped_duplicate": True,
+            "reason": existing.get("message") or "PDF already exists",
+        }
+
+    pdf_path = stored_pdf_path(pdf_id)
+    pdf_path.write_bytes(pdf_bytes)
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        total_pages = doc.page_count
+    if total_pages < 1:
+        raise HTTPException(400, "PDF has no pages")
+
+    start_page = max(1, min(int(start_page or 1), total_pages))
+    default_end_page = min(total_pages, start_page + 9)
+    end_page = default_end_page if end_page is None else max(start_page, min(int(end_page), total_pages))
+    cnr_number = cnr_number_from_filename(filename)
+    upsert_pdf_record(
+        pdf_id=pdf_id,
+        filename=filename,
+        cnr_number=cnr_number,
+        file_size_bytes=len(pdf_bytes),
+        total_pages=total_pages,
+        selected_start_page=start_page,
+        selected_end_page=end_page,
+        indexed_pages=0,
+        status="queued_for_stage1",
+        retrieval_status="queued_for_stage1",
+        index_ready=False,
+        chat_ready=False,
+        pending_pages=total_pages,
+        index_source="",
+        queue_bucket="stage1_batch",
+        deferred_decision="queue",
+        last_error="",
+        review_reason="",
+    )
+    return {
+        "pdf_id": pdf_id,
+        "filename": filename,
+        "cnr_number": cnr_number,
+        "total_pages": total_pages,
+        "status": "queued_for_stage1",
+        "retrieval_status": "queued_for_stage1",
+        "pending_pages": total_pages,
+        "queued": True,
+        "skipped_duplicate": False,
+    }
+
+
+def process_stage1_batch_pdf_impl(pdf_id: str) -> dict:
+    record = get_pdf_record(pdf_id)
+    if not record:
+        raise HTTPException(404, f"PDF {pdf_id} not found")
+
+    pdf_path = stored_pdf_path(pdf_id)
+    if not pdf_path.exists():
+        raise HTTPException(404, f"Stored PDF for {pdf_id} not found")
+
+    filename = record.get("filename") or f"{pdf_id}.pdf"
+    start_page = int(record.get("selected_start_page") or 1)
+    end_page = int(record.get("selected_end_page") or min(int(record.get("total_pages") or 1), start_page + 9))
+    last_error = None
+
+    for attempt in range(1, 4):
+        try:
+            update_pdf_record(
+                pdf_id,
+                status="indexing_running",
+                retrieval_status="queued_for_stage1",
+                queue_bucket="stage1_batch",
+                deferred_decision="queue",
+                last_error="",
+            )
+            payload = build_stage_one_payload(pdf_path.read_bytes(), filename, start_page=start_page, end_page=end_page)
+            if int(payload.get("pending_pages") or 0) > 0:
+                update_pdf_record(
+                    pdf_id,
+                    status="index_ready",
+                    retrieval_status="queued_for_full_ingestion",
+                    queue_bucket="stage1_batch",
+                    deferred_decision="queue",
+                    last_error="",
+                )
+                deferred_resp = process_pending_pdf_impl(pdf_id)
+                refreshed_record = get_pdf_record(pdf_id) or record
+                return {
+                    **payload,
+                    "status": refreshed_record.get("status", deferred_resp.get("status", payload.get("status", "vectorized"))),
+                    "retrieval_status": refreshed_record.get("retrieval_status", deferred_resp.get("retrieval_status", payload.get("retrieval_status", "vectorized"))),
+                    "pending_pages": refreshed_record.get("pending_pages", deferred_resp.get("pending_pages", 0)),
+                    "chat_ready": bool(refreshed_record.get("chat_ready", deferred_resp.get("chat_ready", True))),
+                }
+
+            update_pdf_record(
+                pdf_id,
+                status="vectorized",
+                retrieval_status="vectorized",
+                chat_ready=True,
+                pending_pages=0,
+                queue_bucket="library",
+                deferred_decision="completed",
+                last_error="",
+                review_reason="",
+            )
+            return payload
+        except Exception as exc:
+            last_error = str(exc)
+            log.exception("Stage 1 batch worker failed for %s on attempt %s", pdf_id, attempt)
+            if attempt < 3:
+                update_pdf_record(
+                    pdf_id,
+                    status="queued_for_stage1",
+                    retrieval_status="queued_for_stage1",
+                    queue_bucket="stage1_batch",
+                    deferred_decision="queue",
+                    last_error=last_error,
+                )
+                time.sleep(min(6, attempt * 2))
+                continue
+            update_pdf_record(
+                pdf_id,
+                status="failed",
+                retrieval_status="failed",
+                queue_bucket="stage1_batch",
+                deferred_decision="queue",
+                last_error=last_error,
+            )
+            raise
+
+    raise RuntimeError(last_error or f"Stage 1 batch worker failed for {pdf_id}")
+
+
+def run_stage1_batch_queue_worker():
+    stage1_batch_runner_status.update({
+        "running": True,
+        "processed": 0,
+        "total": len(list_stage1_batch_pdf_ids()),
+        "current_pdf_id": "",
+        "current_filename": "",
+        "last_error": "",
+        "heartbeat_ts": time.time(),
+        "started_at": time.time(),
+        "status": "running",
+    })
+    processed = 0
+    try:
+        while True:
+            pending_ids = list_stage1_batch_pdf_ids()
+            if not pending_ids:
+                break
+            pdf_id = pending_ids[0]
+            record = get_pdf_record(pdf_id) or {}
+            stage1_batch_runner_status.update({
+                "total": processed + len(pending_ids),
+                "current_pdf_id": pdf_id,
+                "current_filename": record.get("filename", ""),
+                "processed": processed,
+                "heartbeat_ts": time.time(),
+            })
+            try:
+                process_stage1_batch_pdf_impl(pdf_id)
+                processed += 1
+            except Exception as exc:
+                stage1_batch_runner_status["last_error"] = str(exc)
+                processed += 1
+            finally:
+                stage1_batch_runner_status["processed"] = processed
+                stage1_batch_runner_status["heartbeat_ts"] = time.time()
+    finally:
+        stage1_batch_runner_status.update({
+            "running": False,
+            "current_pdf_id": "",
+            "current_filename": "",
+            "heartbeat_ts": time.time(),
+            "status": "idle",
+        })
+
+
+def start_stage1_batch_runner_if_needed() -> bool:
+    with stage1_batch_runner_lock:
+        if stage1_batch_runner_status.get("running"):
+            return False
+        if not list_stage1_batch_pdf_ids():
+            return False
+        worker = Thread(target=run_stage1_batch_queue_worker, daemon=True)
+        worker.start()
+        return True
+
+
 def analyze_saved_index_health(index_items: list[dict], total_pages: int) -> dict:
     gap_items = [item for item in index_items if item.get("source") == "gap"]
     non_gap_items = [item for item in index_items if item.get("source") != "gap"]
@@ -3416,6 +3626,41 @@ async def get_page_text(pdf_id: str, page_num: int):
     }
 
 
+@app.post("/api/stage1-batch/enqueue")
+async def enqueue_stage1_batch(
+    files: list[UploadFile] = File(...),
+    start_page: int = Form(1),
+    end_page: Optional[int] = Form(None),
+):
+    results = []
+    seen_pdf_ids: set[str] = set()
+    for file in files:
+        if not file.filename.lower().endswith(".pdf"):
+            results.append({"filename": file.filename, "status": "skipped", "reason": "Only PDF files are accepted"})
+            continue
+        pdf_bytes = await file.read()
+        pdf_id = pdf_id_from_bytes(pdf_bytes)
+        if pdf_id in seen_pdf_ids:
+            results.append({
+                "pdf_id": pdf_id,
+                "filename": file.filename,
+                "status": "skipped",
+                "reason": "Duplicate PDF in the same chunk. Skipping.",
+                "skipped_duplicate": True,
+            })
+            continue
+        seen_pdf_ids.add(pdf_id)
+        results.append(enqueue_pdf_for_stage1(pdf_bytes, file.filename, start_page=start_page, end_page=end_page))
+
+    started_runner = start_stage1_batch_runner_if_needed()
+    return {
+        "pdfs": results,
+        "count": len(results),
+        "started_runner": started_runner,
+        "runner": dict(stage1_batch_runner_status),
+    }
+
+
 @app.post("/api/ingest-batch")
 async def ingest_batch_pdfs(
     files: list[UploadFile] = File(...),
@@ -3485,6 +3730,7 @@ async def get_queues():
         **build_queue_snapshot(),
         "runner": dict(deferred_runner_status),
         "index_runner": dict(index_runner_status),
+        "stage1_batch_runner": dict(stage1_batch_runner_status),
         "audit_runner": dict(audit_runner_status),
         "reindex_runner": dict(reindex_review_runner_status),
     }
@@ -3493,8 +3739,8 @@ async def get_queues():
 @app.post("/api/queues/reset")
 async def reset_queue(queue_name: str = Form(...)):
     queue_value = (queue_name or "").strip().lower()
-    if queue_value not in {"index", "deferred", "reindex"}:
-        raise HTTPException(400, "queue_name must be index, deferred, or reindex")
+    if queue_value not in {"index", "deferred", "reindex", "stage1_batch"}:
+        raise HTTPException(400, "queue_name must be index, deferred, reindex, or stage1_batch")
 
     reset_count = 0
     for record in list_pdf_records():
@@ -3533,6 +3779,22 @@ async def reset_queue(queue_name: str = Form(...)):
                 chat_ready=False,
                 queue_bucket="deferred",
                 deferred_decision="queue" if record.get("deferred_decision") == "queue" else "pending",
+                last_error="",
+            )
+            reset_count += 1
+            continue
+
+        if queue_value == "stage1_batch":
+            should_reset = record.get("queue_bucket") == "stage1_batch" or status in {"queued_for_stage1", "indexing_running", "full_ingestion_running"}
+            if not should_reset:
+                continue
+            update_pdf_record(
+                record["pdf_id"],
+                status="queued_for_stage1",
+                retrieval_status="queued_for_stage1",
+                chat_ready=False,
+                queue_bucket="stage1_batch",
+                deferred_decision="queue",
                 last_error="",
             )
             reset_count += 1
@@ -3852,6 +4114,22 @@ async def start_reindex_review_runner():
     }
 
 
+@app.post("/api/stage1-batch-runner")
+async def start_stage1_batch_background():
+    started = start_stage1_batch_runner_if_needed()
+    if not started:
+        return {
+            "started": False,
+            "runner": dict(stage1_batch_runner_status),
+            "message": "No PDFs are waiting in the Stage 1 batch queue." if not list_stage1_batch_pdf_ids() else "Stage 1 batch queue is already running.",
+        }
+    return {
+        "started": True,
+        "runner": dict(stage1_batch_runner_status),
+        "count": len(list_stage1_batch_pdf_ids()),
+    }
+
+
 @app.post("/api/process-pending-runner")
 async def process_pending_background():
     with deferred_runner_lock:
@@ -4009,6 +4287,7 @@ Return only the transliterated text."""
 @app.on_event("startup")
 async def startup():
     init_workflow_db()
+    resumed_stage1 = start_stage1_batch_runner_if_needed()
     if not LOCAL_TEXT_MODEL:
         log.warning("LOCAL_TEXT_MODEL is not set - AI features will fail")
     log.info(f"Local LLM URL: {LOCAL_LLM_BASE_URL}")
@@ -4024,4 +4303,6 @@ async def startup():
         OCR_WORKER_COUNT,
     )
     await asyncio.to_thread(get_embedder)
+    if resumed_stage1:
+        log.info("Resumed Stage 1 batch queue on startup")
     log.info("Server ready")
