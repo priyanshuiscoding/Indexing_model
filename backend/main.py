@@ -74,6 +74,7 @@ os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", HF_CACHE_PATH)
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 Path(HF_CACHE_PATH).mkdir(parents=True, exist_ok=True)
 DOCUMENT_CATALOG_PATH = Path(__file__).resolve().parent.parent / "document_catalog.json"
+DOCUMENT_CATALOG_UI_PATH = Path(__file__).resolve().parent.parent / "frontend" / "src" / "documentCatalog.js"
 
 LOCAL_LLM_BASE_URL = (os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").rstrip("/")
 LOCAL_TEXT_MODEL = os.getenv("LOCAL_TEXT_MODEL", "qwen2.5:14b")
@@ -93,6 +94,17 @@ try:
     PARENT_DOCUMENT_CATALOG = json.loads(DOCUMENT_CATALOG_PATH.read_text(encoding="utf-8"))
 except Exception:
     PARENT_DOCUMENT_CATALOG = []
+try:
+    catalog_js = DOCUMENT_CATALOG_UI_PATH.read_text(encoding="utf-8")
+    catalog_js = catalog_js.replace("export const documentCatalog =", "", 1).strip()
+    if catalog_js.endswith(";"):
+        catalog_js = catalog_js[:-1].strip()
+    FULL_DOCUMENT_CATALOG = json.loads(catalog_js)
+except Exception:
+    FULL_DOCUMENT_CATALOG = [
+        {**item, "subDocuments": []}
+        for item in PARENT_DOCUMENT_CATALOG
+    ]
 PARENT_DOCUMENT_NAMES = list(dict.fromkeys(
     item["name"].strip()
     for item in PARENT_DOCUMENT_CATALOG
@@ -324,6 +336,112 @@ def sanitize_export_stem(value: str) -> str:
     return cleaned.strip(" .") or "index"
 
 
+def normalize_catalog_label(value: str = "") -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+CATALOG_PARENT_LOOKUP = {
+    normalize_catalog_label(item.get("name", "")): item
+    for item in FULL_DOCUMENT_CATALOG
+    if item.get("name")
+}
+CATALOG_SUBDOC_LOOKUP = {
+    normalize_catalog_label(item.get("name", "")): {
+        normalize_catalog_label(sub_item.get("name", "")): sub_item
+        for sub_item in (item.get("subDocuments") or [])
+        if sub_item.get("name")
+    }
+    for item in FULL_DOCUMENT_CATALOG
+    if item.get("name")
+}
+CATALOG_OTHERS_PARENT = CATALOG_PARENT_LOOKUP.get("others") or CATALOG_PARENT_LOOKUP.get("other") or {
+    "code": "13",
+    "name": "Others",
+    "subDocuments": [],
+}
+
+
+def derive_case_metadata(value: str = "") -> dict:
+    stem = Path(value or "").stem.strip()
+    match = re.search(r"\b([A-Za-z]+)[_-](\d+)[_-](\d{4})\b", stem)
+    if not match:
+        normalized = stem.replace("-", "_").replace(" ", "_").upper()
+        return {
+            "case_no": normalized or stem or "",
+            "case_type": "",
+            "case_number": "",
+            "case_year": "",
+        }
+
+    case_type = match.group(1).upper()
+    case_number = match.group(2)
+    case_year = match.group(3)
+    return {
+        "case_no": f"{case_type}_{case_number}_{case_year}",
+        "case_type": case_type,
+        "case_number": case_number,
+        "case_year": case_year,
+    }
+
+
+def resolve_export_document_fields(item: dict) -> dict:
+    raw_title = str(item.get("title") or item.get("displayTitle") or item.get("originalTitle") or "").strip()
+    raw_subdocument = str(item.get("subDocument") or "").strip()
+    parent = CATALOG_PARENT_LOOKUP.get(normalize_catalog_label(raw_title)) or CATALOG_OTHERS_PARENT
+    doc_code = str(parent.get("code") or CATALOG_OTHERS_PARENT.get("code") or "")
+    doc_name = str(parent.get("name") or raw_title or "Others").strip() or "Others"
+
+    sub_lookup = CATALOG_SUBDOC_LOOKUP.get(normalize_catalog_label(doc_name), {})
+    sub_item = None
+    if raw_subdocument:
+        sub_item = sub_lookup.get(normalize_catalog_label(raw_subdocument))
+    if not sub_item and sub_lookup:
+        sub_item = sub_lookup.get("others") or sub_lookup.get("other")
+
+    if sub_item:
+        doc_subcode = str(sub_item.get("code") or "")
+        doc_subname = str(sub_item.get("name") or raw_subdocument or "Others").strip() or "Others"
+    else:
+        doc_subcode = ""
+        doc_subname = raw_subdocument or "Others"
+
+    if parent is CATALOG_OTHERS_PARENT and not raw_title:
+        raw_title = "Others"
+
+    return {
+        "doc_code": doc_code,
+        "doc_name": doc_name,
+        "doc_subcode": doc_subcode,
+        "doc_subname": doc_subname,
+        "raw_title": raw_title or doc_name,
+        "raw_subdocument": raw_subdocument,
+    }
+
+
+def build_export_document_rows(index_items: list[dict], case_meta: dict) -> list[dict]:
+    rows = []
+    for item in (index_items or []):
+        doc_fields = resolve_export_document_fields(item)
+        rows.append({
+            "case_no": case_meta.get("case_no", ""),
+            "case_type": case_meta.get("case_type", ""),
+            "case_number": case_meta.get("case_number", ""),
+            "case_year": case_meta.get("case_year", ""),
+            **doc_fields,
+            "page_from": item.get("pdfPageFrom", item.get("pageFrom")),
+            "page_to": item.get("pdfPageTo", item.get("pageTo")),
+            "toc_page_from": item.get("tocPageFrom", item.get("pageFrom")),
+            "toc_page_to": item.get("tocPageTo", item.get("pageTo")),
+            "receiving_date": str(item.get("receivingDate") or "").strip(),
+            "serial_no": str(item.get("serialNo") or "").strip(),
+            "court_fee": str(item.get("courtFee") or "").strip(),
+            "source": str(item.get("source") or "").strip(),
+            "note": str(item.get("note") or "").strip(),
+            "batch_no": str(item.get("batchNo") or "").strip(),
+        })
+    return rows
+
+
 def export_index_json(
     pdf_id: str,
     record: Optional[dict],
@@ -338,10 +456,15 @@ def export_index_json(
         or cnr_number_from_filename((record or {}).get("filename", ""))
         or pdf_id
     )
+    case_meta = derive_case_metadata((record or {}).get("filename") or cnr_number)
+    export_rows = build_export_document_rows(index_items, case_meta)
     payload = {
+        "case_no": case_meta.get("case_no", ""),
+        "case_type": case_meta.get("case_type", ""),
+        "case_number": case_meta.get("case_number", ""),
+        "case_year": case_meta.get("case_year", ""),
         "pdf_id": pdf_id,
         "cnr_number": cnr_number,
-        "file_number": cnr_number,
         "filename": (record or {}).get("filename", ""),
         "total_pages": total_pages,
         "indexed_page_start": indexed_start,
@@ -349,19 +472,12 @@ def export_index_json(
         "indexed_pages": max(indexed_end - indexed_start + 1, 0),
         "index_source": index_source,
         "status": (record or {}).get("status", "index_ready"),
-        "index_entries": len(index_items or []),
-        "index": [
-            {
-                **item,
-                "pageFrom": item.get("tocPageFrom", item.get("pageFrom")),
-                "pageTo": item.get("tocPageTo", item.get("pageTo")),
-                "pdfPageFrom": item.get("pdfPageFrom", item.get("pageFrom")),
-                "pdfPageTo": item.get("pdfPageTo", item.get("pageTo")),
-            }
-            for item in (index_items or [])
-        ],
+        "index_entries": len(export_rows),
+        "exported_at": utc_now_iso(),
+        "documents": export_rows,
     }
-    export_path = Path(INDEX_EXPORT_PATH) / f"{sanitize_export_stem(cnr_number)}.json"
+    export_stem = case_meta.get("case_no") or cnr_number or pdf_id
+    export_path = Path(INDEX_EXPORT_PATH) / f"{sanitize_export_stem(export_stem)}.json"
     export_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return export_path
 
@@ -2272,7 +2388,7 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
     pdf_id = pdf_id_from_bytes(pdf_bytes)
     pdf_path = stored_pdf_path(pdf_id)
     pdf_path.write_bytes(pdf_bytes)
-    log.info("Stage 1 ingest for PDF: %s  id=%s", filename, pdf_id)
+    log.info("Full-document ingest for PDF: %s  id=%s", filename, pdf_id)
     timing_collector = PdfTimingCollector(pdf_id, filename)
 
     with timing_collector.stage("file open", "file_open"):
@@ -2282,25 +2398,48 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
         doc.close()
         raise HTTPException(400, "PDF has no pages")
 
-    start_page = max(1, min(start_page, total_pages))
-    default_end_page = min(total_pages, start_page + 9)
-    end_page = default_end_page if end_page is None else min(end_page, total_pages)
-    if start_page > end_page:
-        doc.close()
-        raise HTTPException(400, "Start page must be less than or equal to end page")
-
-    selected_page_numbers = list(range(start_page, end_page + 1))
     try:
-        with timing_collector.stage("first 10-page extraction", "first_10_page_extraction"):
-            pages_data, stats = extract_pages_from_document(doc, selected_page_numbers, total_pages, dpi=250, timing_collector=timing_collector)
+        selected_page_numbers = list(range(1, total_pages + 1))
     finally:
         doc.close()
 
-    replace_extracted_pages(pdf_id, pages_data, stage="fast_index")
+    upsert_pdf_record(
+        pdf_id=pdf_id,
+        filename=filename,
+        cnr_number=cnr_number_from_filename(filename),
+        file_size_bytes=len(pdf_bytes),
+        total_pages=total_pages,
+        selected_start_page=1,
+        selected_end_page=total_pages,
+        indexed_pages=0,
+        status="full_ingestion_running",
+        retrieval_status="full_ingestion_running",
+        index_ready=False,
+        chat_ready=False,
+        pending_pages=total_pages,
+        index_source="",
+        queue_bucket="index",
+        deferred_decision="completed",
+        last_error="",
+        review_reason="",
+    )
+
+    with timing_collector.stage("full text extraction", "full_text_extraction_time"):
+        pages_data, stats = extract_pages_from_pdf_parallel(
+            pdf_path,
+            selected_page_numbers,
+            total_pages,
+            dpi=250,
+            timing_collector=timing_collector,
+            worker_count=OCR_WORKER_COUNT,
+            pdf_id=pdf_id,
+        )
+
+    replace_extracted_pages(pdf_id, pages_data, stage="full_document_ingestion")
     upsert_collection_pages(pdf_id, filename, pages_data, reset=True, timing_collector=timing_collector)
 
-    indexed_pages = len(pages_data)
-    pending_pages = max(total_pages - indexed_pages, 0)
+    indexed_pages = total_pages
+    pending_pages = 0
     cnr_number = cnr_number_from_filename(filename)
     upsert_pdf_record(
         pdf_id=pdf_id,
@@ -2308,37 +2447,38 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
         cnr_number=cnr_number,
         file_size_bytes=len(pdf_bytes),
         total_pages=total_pages,
-        selected_start_page=start_page,
-        selected_end_page=end_page,
+        selected_start_page=1,
+        selected_end_page=total_pages,
         indexed_pages=indexed_pages,
-        status="toc_scanned",
-        retrieval_status="pending_deferred_ingestion" if pending_pages else "vectorized",
+        status="vectorized",
+        retrieval_status="vectorized",
         index_ready=False,
-        chat_ready=not bool(pending_pages),
+        chat_ready=True,
         pending_pages=pending_pages,
         index_source="",
-        queue_bucket="deferred" if pending_pages else "library",
-        deferred_decision="pending" if pending_pages else "completed",
+        queue_bucket="library",
+        deferred_decision="completed",
         last_error="",
+        review_reason="",
     )
 
-    timing_collector.log_summary("stage_1_ingest")
+    timing_collector.log_summary("full_document_ingest")
 
     return {
         "pdf_id": pdf_id,
         "cnr_number": cnr_number,
         "total_pages": total_pages,
         "indexed_pages": indexed_pages,
-        "indexed_page_start": start_page,
-        "indexed_page_end": end_page,
+        "indexed_page_start": 1,
+        "indexed_page_end": total_pages,
         "ocr_pages": stats["ocr_pages"],
         "vision_ocr_pages": stats["vision_ocr_pages"],
         "handwriting_suspected_pages": stats["handwriting_suspected_pages"],
         "digital_pages": stats["digital_pages"],
-        "status": "toc_scanned",
-        "retrieval_status": "pending_deferred_ingestion" if pending_pages else "vectorized",
+        "status": "vectorized",
+        "retrieval_status": "vectorized",
         "pending_pages": pending_pages,
-        "chat_ready": not bool(pending_pages),
+        "chat_ready": True,
         "filename": filename,
     }
 
@@ -2537,7 +2677,7 @@ def process_stage1_batch_pdf_impl(pdf_id: str) -> dict:
             return payload
         except Exception as exc:
             last_error = str(exc)
-            log.exception("Stage 1 batch worker failed for %s on attempt %s", pdf_id, attempt)
+            log.exception("Batch indexing worker failed for %s on attempt %s", pdf_id, attempt)
             if attempt < 3:
                 update_pdf_record(
                     pdf_id,
@@ -2559,7 +2699,7 @@ def process_stage1_batch_pdf_impl(pdf_id: str) -> dict:
             )
             raise
 
-    raise RuntimeError(last_error or f"Stage 1 batch worker failed for {pdf_id}")
+    raise RuntimeError(last_error or f"Batch indexing worker failed for {pdf_id}")
 
 
 def run_stage1_batch_queue_worker():
@@ -2930,7 +3070,7 @@ def run_stage_one_index_worker(pdf_bytes: bytes, filename: str, start_page: int,
             "status": "completed",
         })
     except Exception as exc:
-        log.exception("Stage 1 background indexing failed for %s", filename)
+        log.exception("Background indexing failed for %s", filename)
         update_pdf_record(pdf_id, status="failed", last_error=str(exc))
         index_runner_status.update({
             "running": False,
@@ -3031,9 +3171,9 @@ async def ingest_pdf(
     end_page: Optional[int] = Form(None),
 ):
     """
-    Stage 1 fast indexing pipeline.
-    Save the PDF, scan only the selected window, cache extracted pages,
-    vectorize that subset, and mark the rest for deferred ingestion.
+    Accuracy-first indexing pipeline.
+    Save the PDF, extract the whole document, vectorize the full text,
+    then generate the final index from full-document evidence.
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted")
@@ -3049,7 +3189,7 @@ async def reindex_saved_pdf(
     end_page: Optional[int] = Form(None),
 ):
     """
-    Re-run Stage 1 indexing for an already-saved PDF without requiring the browser
+    Re-run full-document indexing for an already-saved PDF without requiring the browser
     to upload the file again.
     """
     record = get_pdf_record(pdf_id)
@@ -3157,7 +3297,7 @@ If the current page appears relevant, prioritize that page and its nearby pages.
 # -- 3. GENERATE INDEX ─────────────────────────────────────────────────────────
 def generate_index_payload(req: IndexRequest, timing_collector: Optional[PdfTimingCollector] = None) -> dict:
     """
-    Generate the structured document index from cached Stage 1 pages first.
+    Generate the structured document index from the full cached document text.
     If a TOC is detected, ranges are expanded deterministically across the whole PDF.
     """
     record = get_pdf_record(req.pdf_id)
@@ -3627,6 +3767,9 @@ async def generate_index(req: IndexRequest):
             review_reason="" if pending_pages == 0 else record.get("review_reason", ""),
         )
         updated_record = get_pdf_record(req.pdf_id) or record
+        if pending_pages == 0:
+            audit_saved_index_record(req.pdf_id, record=updated_record)
+            updated_record = get_pdf_record(req.pdf_id) or updated_record
         payload["status"] = updated_record.get("status", payload.get("status", "index_ready"))
         payload["retrieval_status"] = updated_record.get("retrieval_status", payload.get("retrieval_status", "legacy"))
         payload["pending_pages"] = updated_record.get("pending_pages", payload.get("pending_pages", 0))
@@ -4171,7 +4314,7 @@ async def start_stage1_batch_background():
         return {
             "started": False,
             "runner": dict(stage1_batch_runner_status),
-            "message": "No PDFs are waiting in the Stage 1 batch queue." if not list_stage1_batch_pdf_ids() else "Stage 1 batch queue is already running.",
+            "message": "No PDFs are waiting in the batch indexing queue." if not list_stage1_batch_pdf_ids() else "Batch indexing queue is already running.",
         }
     return {
         "started": True,
@@ -4357,7 +4500,7 @@ async def startup():
     )
     await asyncio.to_thread(get_embedder)
     if resumed_stage1:
-        log.info("Resumed Stage 1 batch queue on startup")
+        log.info("Resumed batch indexing queue on startup")
     if resumed_deferred:
         log.info("Resumed deferred queue on startup")
     log.info("Server ready")

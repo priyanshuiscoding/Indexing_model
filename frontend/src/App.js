@@ -81,25 +81,25 @@ const describeSavedPdfStatus = (item = {}, flags = {}) => {
     return "Full ingestion and vectorization are running for this PDF.";
   }
   if (flags.isIndexBusy || flags.isStage1BatchBusy || status === "indexing_running") {
-    return "Stage 1 indexing is running in the background for this PDF.";
+    return "Full-document indexing is running in the background for this PDF.";
   }
   if (item.review_reason) {
     return `Flagged for review: ${item.review_reason}`;
   }
   if (status === "queued_for_stage1" || item.queue_bucket === "stage1_batch") {
-    return "Uploaded and queued for Stage 1 indexing. The backend will continue even if you close the browser.";
+    return "Uploaded and queued for full-document indexing. The backend will continue even if you close the browser.";
   }
   if ((retrieval === "full_ingestion_running" || status === "full_ingestion_running") && pending > 0) {
-    return "Stage 1 index is ready. Full ingestion and vectorization are now running.";
+    return "Full-document extraction and vectorization are running before final indexing.";
   }
   if (status === "index_ready" && pending > 0 && retrieval === "queued_for_full_ingestion") {
-    return "Stage 1 index is ready. Remaining pages are queued for full ingestion.";
+    return "Legacy partial record detected. Remaining pages are queued for full ingestion.";
   }
   if (status === "index_ready" && pending > 0) {
-    return "Stage 1 index is ready. Remaining pages can now be vectorized from the deferred queue.";
+    return "Legacy partial record detected. Remaining pages can be vectorized from the deferred queue.";
   }
   if (pending > 0) {
-    return "Stage 1 index is ready. Remaining pages are still pending vectorization.";
+    return "Legacy partial record detected. Remaining pages are still pending vectorization.";
   }
   return "This PDF is fully ready in the backend library.";
 };
@@ -108,9 +108,9 @@ const formatSavedPdfStatus = (item = {}) => {
   const status = (item.status || "").toLowerCase();
   const retrieval = (item.retrieval_status || "").toLowerCase();
 
-  if (status === "queued_for_stage1") return "Queued for Stage 1";
-  if (status === "indexing_running") return "Stage 1 Running";
-  if (status === "index_ready") return retrieval === "queued_for_full_ingestion" ? "Index Ready, Deferred Queued" : "Index Ready";
+  if (status === "queued_for_stage1") return "Queued for Indexing";
+  if (status === "indexing_running") return "Indexing Running";
+  if (status === "index_ready") return retrieval === "queued_for_full_ingestion" ? "Index Ready, Review Pending" : "Index Ready";
   if (status === "full_ingestion_running" || retrieval === "full_ingestion_running") return "Full Ingestion Running";
   if (status === "vectorized" || retrieval === "vectorized") return "Vectorized";
   if (status === "failed" || retrieval === "failed") return "Failed";
@@ -416,23 +416,23 @@ function QueueStatusModal({
         <div className="queue-modal-header">
           <div>
             <div className="section-title">Queue And Live Status</div>
-            <div className="section-subtitle">Keep deferred processing, index audit, and review reindexing in one clean operations panel.</div>
+            <div className="section-subtitle">Keep batch indexing, audit, and review reindexing in one clean operations panel.</div>
           </div>
           <button className="modal-close" onClick={onClose}>x</button>
         </div>
         <div className="queue-toolbar">
           <span className="queue-pill">Index queue: {savedPdfs.filter((item) => !item.index_ready).length}</span>
-          <span className="queue-pill">Stage 1 batch queue: {stage1QueueCount}</span>
+          <span className="queue-pill">Batch indexing queue: {stage1QueueCount}</span>
           <span className="queue-pill">Deferred queue: {(queueSnapshot.pending_vectorization || []).length}</span>
           <span className="queue-pill warning">Review queue: {reviewQueueCount}</span>
           {(queueSnapshot.runner?.running || queueSnapshot.runner?.paused) && (
             <span className="queue-pill success">{runnerStateLabel} {queueSnapshot.runner.processed}/{queueSnapshot.runner.total}: {queueSnapshot.runner.current_filename || queueSnapshot.runner.current_pdf_id || "Queue saved"}</span>
           )}
           {indexRunner.running && (
-            <span className="queue-pill success">Indexing: {indexRunner.current_filename || indexRunner.current_pdf_id || "Stage 1 running"}</span>
+            <span className="queue-pill success">Indexing: {indexRunner.current_filename || indexRunner.current_pdf_id || "Indexing running"}</span>
           )}
           {stage1BatchRunner.running && (
-            <span className="queue-pill success">Overnight Stage 1: {stage1BatchRunner.processed || 0}/{stage1BatchRunner.total || 0}</span>
+            <span className="queue-pill success">Batch indexing: {stage1BatchRunner.processed || 0}/{stage1BatchRunner.total || 0}</span>
           )}
           {auditRunner.running && (
             <span className="queue-pill warning">Audit: {auditRunner.processed || 0}/{auditRunner.total || 0} - flagged {auditRunner.flagged || 0}</span>
@@ -475,11 +475,11 @@ function QueueStatusModal({
           <button className="queue-resume-btn" onClick={() => controlDeferredQueue("resume")} disabled={loading || !queueSnapshot.runner?.paused || queueSnapshot.runner?.running}>Resume Queue</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("index")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Index Queue</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("deferred")} disabled={loading || queueSnapshot.runner?.running}>Force Reset Deferred Queue</button>
-          <button className="queue-reset-btn" onClick={() => forceResetQueue("stage1_batch")} disabled={loading || stage1BatchRunner.running}>Force Reset Stage 1 Batch Queue</button>
+          <button className="queue-reset-btn" onClick={() => forceResetQueue("stage1_batch")} disabled={loading || stage1BatchRunner.running}>Force Reset Batch Queue</button>
           <button className="queue-reset-btn" onClick={() => forceResetQueue("reindex")} disabled={loading || reindexRunner.running}>Clear Review Queue</button>
         </div>
         <div className="library-help">
-          Chunked batch upload feeds the overnight Stage 1 queue, which then auto-chains into full ingestion. The review queue is separate and only repairs bad saved indexes from already vectorized PDFs.
+          Chunked batch upload feeds the backend indexing queue, which processes whole PDFs before generating final indexes. The review queue is separate and only repairs suspicious saved indexes from already vectorized PDFs.
         </div>
         <div className="runner-panel compact">
           <div className="runner-panel-header">
@@ -518,7 +518,7 @@ function QueueStatusModal({
         </div>
         <div className="runner-panel compact">
           <div className="runner-panel-header">
-            <span className={`runner-state ${stage1BatchRunner.running ? "running" : "idle"}`}>{stage1BatchRunner.running ? "Stage 1 Batch Running" : "Stage 1 Batch Idle"}</span>
+            <span className={`runner-state ${stage1BatchRunner.running ? "running" : "idle"}`}>{stage1BatchRunner.running ? "Batch Indexing Running" : "Batch Indexing Idle"}</span>
             <span className="runner-meta">Processed {stage1BatchRunner.processed || 0} of {stage1BatchRunner.total || 0}</span>
             {stage1BatchRunner.heartbeat_ts ? <span className="runner-meta">Last update {Math.max(0, Math.round(Date.now() / 1000 - stage1BatchRunner.heartbeat_ts))}s ago</span> : null}
           </div>
@@ -529,7 +529,7 @@ function QueueStatusModal({
             </div>
             <div>
               <div className="runner-label">Queue State</div>
-              <div className="runner-value">{stage1BatchRunner.running ? "Chunked batch queue is processing in backend and auto-chaining into full ingestion." : "No overnight Stage 1 batch queue is running."}</div>
+              <div className="runner-value">{stage1BatchRunner.running ? "Chunked batch queue is processing full-document indexing in the backend." : "No batch indexing queue is running."}</div>
             </div>
             <div>
               <div className="runner-label">Last Error</div>
@@ -537,7 +537,7 @@ function QueueStatusModal({
             </div>
             <div>
               <div className="runner-label">Operator Hint</div>
-              <div className="runner-value muted">Upload large batches in chunks and let the backend continue even after the browser tab is closed.</div>
+              <div className="runner-value muted">Upload large batches in chunks and let the backend finish full-document indexing even after the browser tab is closed.</div>
             </div>
           </div>
         </div>
@@ -1178,7 +1178,7 @@ export default function App() {
       setTotalPages(pdf.total_pages || doc.numPages);
       setCurrentPage(1);
       setIndexStartPage(String(pdf.selected_start_page || 1));
-      setIndexEndPage(String(pdf.selected_end_page || Math.min(doc.numPages, 10)));
+      setIndexEndPage(String(pdf.selected_end_page || doc.numPages));
       setWorkflowStatus(pdf.status || "");
       setRetrievalStatus(pdf.retrieval_status || "");
       setPendingPages(pdf.pending_pages || 0);
@@ -1217,7 +1217,7 @@ export default function App() {
       await loadSavedPdf(targetPdfId);
     }
     if (targetRecord && !targetRecord.index_ready) {
-      setError("Index is not ready yet for this PDF. It is still queued for Stage 1 indexing.");
+      setError("Index is not finalized yet for this PDF. It is still queued for full-document indexing or review.");
     }
     setTab("index");
     setShowQueueModal(false);
@@ -1253,7 +1253,7 @@ export default function App() {
           setChatReady(Boolean(pdf.chat_ready));
           setIndexedRange({
             start: pdf.selected_start_page || 1,
-            end: pdf.selected_end_page || Math.min(pdf.total_pages || totalPages || 1, 10),
+            end: pdf.selected_end_page || (pdf.total_pages || totalPages || 1),
             count: pdf.indexed_pages || 0,
           });
         })
@@ -1283,7 +1283,7 @@ export default function App() {
           setChatReady(Boolean(pdf.chat_ready));
           setIndexedRange({
             start: pdf.selected_start_page || 1,
-            end: pdf.selected_end_page || Math.min(pdf.total_pages || totalPages || 1, 10),
+            end: pdf.selected_end_page || (pdf.total_pages || totalPages || 1),
             count: pdf.indexed_pages || 0,
           });
         })
@@ -1303,7 +1303,7 @@ export default function App() {
       let firstQueuedPdfId = "";
       for (let idx = 0; idx < files.length; idx += BATCH_UPLOAD_CHUNK_SIZE) {
         const chunk = files.slice(idx, idx + BATCH_UPLOAD_CHUNK_SIZE);
-        setLoadingStep(`Queueing PDFs ${idx + 1}-${Math.min(files.length, idx + chunk.length)} of ${files.length} for overnight indexing...`);
+        setLoadingStep(`Queueing PDFs ${idx + 1}-${Math.min(files.length, idx + chunk.length)} of ${files.length} for batch indexing...`);
         const formData = new FormData();
         chunk.forEach((file) => formData.append("files", file));
         formData.append("start_page", "1");
@@ -1374,7 +1374,7 @@ export default function App() {
       setTotalPages(doc.numPages);
       setCurrentPage(1);
       setIndexStartPage("1");
-      setIndexEndPage(String(Math.min(doc.numPages, 10)));
+      setIndexEndPage(String(doc.numPages));
     } catch (err) {
       console.error(err);
       setPdfDoc(null);
@@ -1406,7 +1406,7 @@ export default function App() {
 
       let resp;
       if (isRealFile(pdfFile)) {
-        setLoadingStep(`Starting background indexing for pages ${start} to ${end}...`);
+        setLoadingStep(`Starting full-document indexing for ${totalPages} pages...`);
         const formData = new FormData();
         formData.append("file", pdfFile);
         formData.append("start_page", String(start));
@@ -1425,7 +1425,7 @@ export default function App() {
         setPdfId(resp.pdf_id);
         handledIndexRunnerRef.current = "";
       } else if (pdfId) {
-        setLoadingStep(`Starting background re-indexing for pages ${start} to ${end}...`);
+        setLoadingStep(`Starting full-document re-indexing for ${totalPages} pages...`);
         const formData = new FormData();
         formData.append("start_page", String(start));
         formData.append("end_page", String(end));
@@ -1486,7 +1486,7 @@ export default function App() {
     if (!pdfId) return;
     setError("");
     setLoading(true);
-    setLoadingStep(`Deferred ingestion - processing ${pendingPages} pending pages...`);
+    setLoadingStep(`Legacy deferred ingestion - processing ${pendingPages} pending pages...`);
     try {
       const resp = await apiFetch(`/api/process-pending/${pdfId}`, { method: "POST" });
       setWorkflowStatus(resp.status || "vectorized");
@@ -1783,7 +1783,7 @@ export default function App() {
               <div className="library-summary-strip">
                 <span className="queue-pill">Indexed: {indexedPdfCount}</span>
                 <span className="queue-pill success">Vectorized: {vectorizedPdfCount}</span>
-                <span className="queue-pill">Stage 1 Batch: {(queueSnapshot.stage1_batch || []).length}</span>
+                <span className="queue-pill">Batch Queue: {(queueSnapshot.stage1_batch || []).length}</span>
                 <span className="queue-pill">Pending Queue: {(queueSnapshot.pending_vectorization || []).length}</span>
                 <span className="queue-pill warning">Review Queue: {reviewPdfCount}</span>
               </div>
@@ -1857,13 +1857,13 @@ export default function App() {
               <div className="indexing-copy">
                 <div className="indexing-title">Indexing Controls</div>
                 <div className="indexing-hint">
-                  Upload loads the preview first. Stage 1 then scans pages 1-10 by default, builds and saves the index immediately, and leaves the remaining pages for deferred ingestion unless you process them now.
+                  Upload loads the preview first. The backend then extracts and vectorizes the full PDF before building the final index from whole-document evidence and routing weak results to review.
                 </div>
               </div>
               <div className="workflow-help">
                 <span>1. Upload or fetch a PDF.</span>
-                <span>2. Click Start Indexing to save Stage 1 in the backend.</span>
-                <span>3. Use Process Pending now for small PDFs, or Save To Queue for later full vectorization.</span>
+                <span>2. Click Start Indexing to run full-document OCR, vectorization, and final indexing in the backend.</span>
+                <span>3. Legacy partial PDFs can still use Process Pending or Save To Queue, but new PDFs follow the full-document workflow automatically.</span>
               </div>
               <div className="indexing-form">
                 <div className="range-group">
@@ -2025,7 +2025,7 @@ export default function App() {
                     <div style={{ textAlign: "center", padding: 60, color: "#9ca3af" }}>
                       <div style={{ fontSize: 48, marginBottom: 12 }}>IDX</div>
                       <div style={{ fontWeight: 500, marginBottom: 6 }}>Preview loaded</div>
-                      <div style={{ fontSize: 13 }}>Stage 1 will scan pages 1-10 by default unless you choose another range</div>
+                      <div style={{ fontSize: 13 }}>Full-document indexing now scans every page before finalizing the index</div>
                     </div>
                   ) : (
                     <div style={{ textAlign: "center", padding: 60, color: "#9ca3af" }}>
