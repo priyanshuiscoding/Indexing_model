@@ -59,6 +59,7 @@ from workflow_state import (
     update_pdf_record,
     upsert_extracted_pages,
     upsert_pdf_record,
+    utc_now_iso,
 )
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -83,6 +84,7 @@ LOCAL_LLM_TIMEOUT = float(os.getenv("LOCAL_LLM_TIMEOUT", "180"))
 CHROMA_DB_PATH   = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 PDF_STORAGE_PATH = os.getenv("PDF_STORAGE_PATH", "./stored_pdfs")
 INDEX_EXPORT_PATH = os.getenv("INDEX_EXPORT_PATH", "./index_exports")
+TIMING_LOG_PATH = os.getenv("TIMING_LOG_PATH", "./timing_logs")
 TESSERACT_LANG   = os.getenv("TESSERACT_LANG", "hin+eng")
 ENABLE_HANDWRITTEN_HINDI_ASSIST = os.getenv("ENABLE_HANDWRITTEN_HINDI_ASSIST", "true").lower() != "false"
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
@@ -162,6 +164,7 @@ deferred_runner_status = {
     "heartbeat_ts": time.time(),
     "pause_requested": False,
     "paused": False,
+    "stop_requested": False,
 }
 
 index_runner_lock = Lock()
@@ -175,6 +178,7 @@ index_runner_status = {
     "finished_pdf_id": "",
     "finished_filename": "",
     "status": "idle",
+    "stop_requested": False,
 }
 
 stage1_batch_runner_lock = Lock()
@@ -188,6 +192,7 @@ stage1_batch_runner_status = {
     "heartbeat_ts": time.time(),
     "started_at": 0.0,
     "status": "idle",
+    "stop_requested": False,
 }
 
 audit_runner_lock = Lock()
@@ -202,6 +207,7 @@ audit_runner_status = {
     "heartbeat_ts": time.time(),
     "started_at": 0.0,
     "status": "idle",
+    "stop_requested": False,
 }
 
 reindex_review_runner_lock = Lock()
@@ -216,12 +222,60 @@ reindex_review_runner_status = {
     "heartbeat_ts": time.time(),
     "started_at": 0.0,
     "status": "idle",
+    "stop_requested": False,
 }
+
+pdf_timing_history: dict[str, list[dict]] = {}
+pdf_timing_lock = Lock()
+
+
+def timing_log_path(pdf_id: str) -> Path:
+    return Path(TIMING_LOG_PATH) / f"{pdf_id}.json"
+
+
+def record_pdf_timing_run(pdf_id: str, filename: str, run_label: str, timings: dict[str, float]):
+    event = {
+        "recorded_at": utc_now_iso(),
+        "filename": filename or "",
+        "run_label": run_label,
+        "timings": {key: round(value, 3) for key, value in timings.items()},
+        "total_seconds": round(sum(timings.values()), 3),
+    }
+    with pdf_timing_lock:
+        history = pdf_timing_history.setdefault(pdf_id, [])
+        history.append(event)
+        if len(history) > 20:
+            del history[:-20]
+        try:
+            timing_log_path(pdf_id).write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            log.exception("Failed to persist timing history for %s", pdf_id)
+
+
+def get_pdf_timing_history(pdf_id: str) -> list[dict]:
+    with pdf_timing_lock:
+        history = pdf_timing_history.get(pdf_id)
+        if history is not None:
+            return list(history)
+        log_path = timing_log_path(pdf_id)
+        if not log_path.exists():
+            return []
+        try:
+            loaded = json.loads(log_path.read_text(encoding="utf-8"))
+        except Exception:
+            log.exception("Failed to read timing history for %s", pdf_id)
+            return []
+        if not isinstance(loaded, list):
+            return []
+        normalized = loaded[-20:]
+        pdf_timing_history[pdf_id] = normalized
+        return list(normalized)
 
 # ── ChromaDB ──────────────────────────────────────────────────────────────────
 Path(CHROMA_DB_PATH).mkdir(parents=True, exist_ok=True)
 Path(PDF_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 Path(INDEX_EXPORT_PATH).mkdir(parents=True, exist_ok=True)
+Path(TIMING_LOG_PATH).mkdir(parents=True, exist_ok=True)
 chroma_client = chromadb.PersistentClient(
     path=CHROMA_DB_PATH,
     settings=Settings(anonymized_telemetry=False),
@@ -320,6 +374,7 @@ class PdfTimingCollector:
                     TIMING_LABELS.get(key, key),
                     self.timings[key],
                 )
+        record_pdf_timing_run(self.pdf_id, self.filename, run_label, self.timings)
 
 def pdf_id_from_bytes(data: bytes) -> str:
     """Stable ID for a PDF based on its content hash."""
@@ -2412,7 +2467,7 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
         selected_start_page=1,
         selected_end_page=total_pages,
         indexed_pages=0,
-        status="full_ingestion_running",
+        status="extracting_text",
         retrieval_status="full_ingestion_running",
         index_ready=False,
         chat_ready=False,
@@ -2435,6 +2490,15 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
             pdf_id=pdf_id,
         )
 
+    update_pdf_record(
+        pdf_id,
+        status="vectorizing",
+        retrieval_status="full_ingestion_running",
+        indexed_pages=len(pages_data),
+        pending_pages=0,
+        selected_start_page=1,
+        selected_end_page=total_pages,
+    )
     replace_extracted_pages(pdf_id, pages_data, stage="full_document_ingestion")
     upsert_collection_pages(pdf_id, filename, pages_data, reset=True, timing_collector=timing_collector)
 
@@ -2498,6 +2562,13 @@ def health():
 # ── 1. INGEST PDF ─────────────────────────────────────────────────────────────
 async def build_stage_one_payload_async(pdf_bytes: bytes, filename: str, start_page: int = 1, end_page: Optional[int] = None) -> dict:
     ingest_resp = run_stage_one_ingest(pdf_bytes, filename, start_page=start_page, end_page=end_page)
+    update_pdf_record(
+        ingest_resp["pdf_id"],
+        status="building_index",
+        retrieval_status="vectorized",
+        indexed_pages=ingest_resp.get("indexed_pages", 0),
+        pending_pages=0,
+    )
     index_resp = await generate_index(IndexRequest(pdf_id=ingest_resp["pdf_id"]))
     return {
         **ingest_resp,
@@ -2713,10 +2784,17 @@ def run_stage1_batch_queue_worker():
         "heartbeat_ts": time.time(),
         "started_at": time.time(),
         "status": "running",
+        "stop_requested": False,
     })
     processed = 0
     try:
         while True:
+            if stage1_batch_runner_status.get("stop_requested"):
+                stage1_batch_runner_status.update({
+                    "status": "stopping",
+                    "heartbeat_ts": time.time(),
+                })
+                break
             pending_ids = list_stage1_batch_pdf_ids()
             if not pending_ids:
                 break
@@ -2745,6 +2823,7 @@ def run_stage1_batch_queue_worker():
             "current_filename": "",
             "heartbeat_ts": time.time(),
             "status": "idle",
+            "stop_requested": False,
         })
 
 
@@ -2951,10 +3030,14 @@ def run_index_audit_worker(records: list[dict]):
         "heartbeat_ts": time.time(),
         "started_at": time.time(),
         "status": "running",
+        "stop_requested": False,
     })
     flagged = 0
     try:
         for index, record in enumerate(records, start=1):
+            if audit_runner_status.get("stop_requested"):
+                audit_runner_status.update({"status": "stopping", "heartbeat_ts": time.time()})
+                break
             audit_runner_status.update({
                 "current_pdf_id": record.get("pdf_id", ""),
                 "current_filename": record.get("filename", ""),
@@ -2980,6 +3063,7 @@ def run_index_audit_worker(records: list[dict]):
             "current_filename": "",
             "heartbeat_ts": time.time(),
             "status": "idle",
+            "stop_requested": False,
         })
 
 
@@ -2995,10 +3079,14 @@ def run_reindex_review_worker(pdf_ids: list[str]):
         "heartbeat_ts": time.time(),
         "started_at": time.time(),
         "status": "running",
+        "stop_requested": False,
     })
     fixed = 0
     try:
         for index, pdf_id in enumerate(pdf_ids, start=1):
+            if reindex_review_runner_status.get("stop_requested"):
+                reindex_review_runner_status.update({"status": "stopping", "heartbeat_ts": time.time()})
+                break
             record = get_pdf_record(pdf_id) or {}
             reindex_review_runner_status.update({
                 "current_pdf_id": pdf_id,
@@ -3042,6 +3130,7 @@ def run_reindex_review_worker(pdf_ids: list[str]):
             "current_filename": "",
             "heartbeat_ts": time.time(),
             "status": "idle",
+            "stop_requested": False,
         })
 
 
@@ -3057,8 +3146,21 @@ def run_stage_one_index_worker(pdf_bytes: bytes, filename: str, start_page: int,
         "finished_pdf_id": "",
         "finished_filename": "",
         "status": "running",
+        "stop_requested": False,
     })
     try:
+        if index_runner_status.get("stop_requested"):
+            index_runner_status.update({
+                "running": False,
+                "current_pdf_id": "",
+                "current_filename": "",
+                "heartbeat_ts": time.time(),
+                "finished_pdf_id": pdf_id,
+                "finished_filename": filename,
+                "status": "stopped",
+                "stop_requested": False,
+            })
+            return
         build_stage_one_payload(pdf_bytes, filename, start_page=start_page, end_page=end_page)
         index_runner_status.update({
             "running": False,
@@ -3068,6 +3170,7 @@ def run_stage_one_index_worker(pdf_bytes: bytes, filename: str, start_page: int,
             "finished_pdf_id": pdf_id,
             "finished_filename": filename,
             "status": "completed",
+            "stop_requested": False,
         })
     except Exception as exc:
         log.exception("Background indexing failed for %s", filename)
@@ -3081,6 +3184,7 @@ def run_stage_one_index_worker(pdf_bytes: bytes, filename: str, start_page: int,
             "finished_pdf_id": pdf_id,
             "finished_filename": filename,
             "status": "failed",
+            "stop_requested": False,
         })
 
 
@@ -4008,6 +4112,18 @@ async def reset_queue(queue_name: str = Form(...)):
     }
 
 
+@app.get("/api/pdfs/{pdf_id}/timings")
+async def get_pdf_timings(pdf_id: str):
+    record = get_pdf_record(pdf_id)
+    if not record:
+        raise HTTPException(404, f"PDF {pdf_id} not found")
+    return {
+        "pdf_id": pdf_id,
+        "filename": record.get("filename") or f"{pdf_id}.pdf",
+        "events": get_pdf_timing_history(pdf_id),
+    }
+
+
 @app.get("/api/pdfs/{pdf_id}")
 async def get_pdf_details(pdf_id: str):
     record = get_pdf_record(pdf_id)
@@ -4335,6 +4451,7 @@ def start_deferred_runner_if_needed(force_resume: bool = False) -> bool:
         deferred_runner_status.update({
             "pause_requested": False,
             "paused": False,
+            "stop_requested": False,
             "processed": 0,
             "total": len(pdf_ids),
             "heartbeat_ts": time.time(),
@@ -4357,6 +4474,70 @@ async def process_pending_background():
         "started": True,
         "runner": dict(deferred_runner_status),
         "count": len(list_pending_pdf_ids()),
+    }
+
+
+@app.post("/api/runners/control-all")
+async def control_all_runners(action: str = Form(...)):
+    action_value = (action or "").strip().lower()
+    if action_value != "stop":
+        raise HTTPException(400, "action must be stop")
+
+    messages = []
+
+    with deferred_runner_lock:
+        if deferred_runner_status.get("running"):
+            deferred_runner_status.update({
+                "pause_requested": True,
+                "stop_requested": True,
+                "heartbeat_ts": time.time(),
+            })
+            messages.append("Deferred queue will stop after the current PDF.")
+
+    with stage1_batch_runner_lock:
+        if stage1_batch_runner_status.get("running"):
+            stage1_batch_runner_status.update({
+                "stop_requested": True,
+                "status": "stopping",
+                "heartbeat_ts": time.time(),
+            })
+            messages.append("Batch indexing queue will stop after the current PDF.")
+
+    with audit_runner_lock:
+        if audit_runner_status.get("running"):
+            audit_runner_status.update({
+                "stop_requested": True,
+                "status": "stopping",
+                "heartbeat_ts": time.time(),
+            })
+            messages.append("Audit runner will stop after the current PDF.")
+
+    with reindex_review_runner_lock:
+        if reindex_review_runner_status.get("running"):
+            reindex_review_runner_status.update({
+                "stop_requested": True,
+                "status": "stopping",
+                "heartbeat_ts": time.time(),
+            })
+            messages.append("Review reindex runner will stop after the current PDF.")
+
+    with index_runner_lock:
+        if index_runner_status.get("running"):
+            index_runner_status.update({
+                "stop_requested": True,
+                "status": "stopping",
+                "heartbeat_ts": time.time(),
+            })
+            messages.append("Current indexing job cannot be killed mid-file safely; it will finish the current PDF only.")
+
+    return {
+        "accepted": bool(messages),
+        "message": " ".join(messages) if messages else "No background runner is active.",
+        "runner": dict(deferred_runner_status),
+        "index_runner": dict(index_runner_status),
+        "stage1_batch_runner": dict(stage1_batch_runner_status),
+        "audit_runner": dict(audit_runner_status),
+        "reindex_runner": dict(reindex_review_runner_status),
     }
 
 
