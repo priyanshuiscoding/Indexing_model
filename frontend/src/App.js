@@ -454,6 +454,7 @@ function QueueStatusModal({
   setAuditRowEnd,
   pdfSearch,
   batchFilter,
+  batchReports,
 }) {
   if (!open) return null;
 
@@ -567,6 +568,37 @@ function QueueStatusModal({
             )) : <div className="queue-list-empty">No PDFs are waiting in the batch queue.</div>}
           </div>
         </div>
+        <div className="runner-panel compact batch-report-panel">
+          <div className="runner-panel-header">
+            <span className="runner-state idle">Recent Batch Reports</span>
+            <span className="runner-meta">Saved in backend for overnight comparison</span>
+          </div>
+          {batchReports.length ? (
+            <div className="batch-report-list">
+              {batchReports.map((report) => {
+                const summary = report.summary || {};
+                return (
+                  <div key={report.batch_run_id} className="batch-report-card">
+                    <div className="batch-report-head">
+                      <strong>{report.batch_run_id}</strong>
+                      <span className={`runner-state ${report.status === 'completed' ? 'idle' : 'running'}`}>{report.status || 'unknown'}</span>
+                    </div>
+                    <div className="batch-report-meta">Started {formatEventTimestamp(report.started_at)} | Last update {formatEventTimestamp(report.generated_at)}</div>
+                    <div className="batch-report-grid">
+                      <div><span>Total PDFs</span><strong>{summary.total_pdfs || 0}</strong></div>
+                      <div><span>Completed</span><strong>{summary.completed_pdfs || 0}</strong></div>
+                      <div><span>Review</span><strong>{summary.review_pdfs || 0}</strong></div>
+                      <div><span>Vectorized</span><strong>{summary.vectorized_pdfs || 0}</strong></div>
+                      <div><span>Logged time</span><strong>{summary.total_logged_seconds || 0}s</strong></div>
+                    </div>
+                    <div className="batch-report-meta">{report.path}</div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : <div className="queue-list-empty">No batch reports have been saved yet.</div>}
+        </div>
+
         <div className="runner-panel compact timing-panel">
           <div className="runner-panel-header">
             <span className="runner-state idle">Timing History</span>
@@ -1131,6 +1163,7 @@ export default function App() {
   const [queueSnapshot, setQueueSnapshot] = useState(EMPTY_QUEUE_SNAPSHOT);
   const [selectedSavedPdfId, setSelectedSavedPdfId] = useState("");
   const [timingEvents, setTimingEvents] = useState([]);
+  const [batchReports, setBatchReports] = useState([]);
   const [showTimingPanel, setShowTimingPanel] = useState(false);
   const [viewerTimingEvent, setViewerTimingEvent] = useState(null);
 
@@ -1333,6 +1366,16 @@ export default function App() {
     }
   }, []);
 
+  const fetchBatchReports = useCallback(async () => {
+    try {
+      const resp = await apiFetch('/api/batch-reports?limit=8');
+      setBatchReports(resp.reports || []);
+    } catch (err) {
+      console.error(err);
+      setBatchReports([]);
+    }
+  }, []);
+
   const loadSavedPdf = useCallback(async (targetPdfId) => {
     if (!targetPdfId) return;
     const requestId = activeLoadRequestRef.current + 1;
@@ -1451,15 +1494,17 @@ export default function App() {
   useEffect(() => {
     fetchSavedPdfs();
     fetchQueues();
+    fetchBatchReports();
     const timer = setInterval(() => {
       fetchSavedPdfs(pdfSearch);
       fetchQueues();
+      fetchBatchReports();
       if (selectedSavedPdfId) {
         fetchPdfTimings(selectedSavedPdfId);
       }
     }, 3000);
     return () => clearInterval(timer);
-  }, [fetchPdfTimings, fetchSavedPdfs, fetchQueues, pdfSearch, selectedSavedPdfId]);
+  }, [fetchBatchReports, fetchPdfTimings, fetchSavedPdfs, fetchQueues, pdfSearch, selectedSavedPdfId]);
 
   useEffect(() => {
     const indexRunner = queueSnapshot.index_runner || {};

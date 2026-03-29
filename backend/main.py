@@ -85,6 +85,7 @@ CHROMA_DB_PATH   = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 PDF_STORAGE_PATH = os.getenv("PDF_STORAGE_PATH", "./stored_pdfs")
 INDEX_EXPORT_PATH = os.getenv("INDEX_EXPORT_PATH", "./index_exports")
 TIMING_LOG_PATH = os.getenv("TIMING_LOG_PATH", "./timing_logs")
+BATCH_REPORT_PATH = os.getenv("BATCH_REPORT_PATH", "./batch_reports")
 TESSERACT_LANG   = os.getenv("TESSERACT_LANG", "hin+eng")
 ENABLE_HANDWRITTEN_HINDI_ASSIST = os.getenv("ENABLE_HANDWRITTEN_HINDI_ASSIST", "true").lower() != "false"
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
@@ -250,6 +251,7 @@ def record_pdf_timing_run(pdf_id: str, filename: str, run_label: str, timings: d
             timing_log_path(pdf_id).write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             log.exception("Failed to persist timing history for %s", pdf_id)
+    update_batch_report_for_pdf(pdf_id)
 
 
 def get_pdf_timing_history(pdf_id: str) -> list[dict]:
@@ -271,11 +273,141 @@ def get_pdf_timing_history(pdf_id: str) -> list[dict]:
         pdf_timing_history[pdf_id] = normalized
         return list(normalized)
 
+
+def batch_report_path(batch_run_id: str) -> Path:
+    return Path(BATCH_REPORT_PATH) / f"{sanitize_export_stem(batch_run_id)}.json"
+
+
+def create_batch_run_id() -> str:
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    suffix = hashlib.md5(f"{stamp}-{time.time()}".encode("utf-8")).hexdigest()[:6]
+    return f"batch_{stamp}_{suffix}"
+
+
+def is_terminal_pdf_status(record: Optional[dict]) -> bool:
+    if not record:
+        return False
+    status = str(record.get("status") or "").lower()
+    retrieval = str(record.get("retrieval_status") or "").lower()
+    if status in {"queued_for_stage1", "indexing_running", "extracting_text", "vectorizing", "building_index", "full_ingestion_running"}:
+        return False
+    if retrieval in {"queued_for_stage1", "full_ingestion_running"}:
+        return False
+    if int(record.get("pending_pages") or 0) > 0 and retrieval not in {"vectorized", "queued_for_full_ingestion"}:
+        return False
+    return True
+
+
+def build_batch_pdf_entry(record: dict) -> dict:
+    pdf_id = record.get("pdf_id") or ""
+    timing_events = get_pdf_timing_history(pdf_id)
+    saved_index = get_saved_index(pdf_id)
+    source_counts: dict[str, int] = {}
+    for item in saved_index:
+        source = str(item.get("source") or "unknown").strip() or "unknown"
+        source_counts[source] = source_counts.get(source, 0) + 1
+    latest_event = timing_events[-1] if timing_events else {}
+    latest_total = float(latest_event.get("total_seconds") or 0.0)
+    total_logged = round(sum(float(event.get("total_seconds") or 0.0) for event in timing_events), 3)
+    return {
+        "pdf_id": pdf_id,
+        "filename": record.get("filename") or f"{pdf_id}.pdf",
+        "cnr_number": record.get("cnr_number") or "",
+        "status": record.get("status") or "",
+        "retrieval_status": record.get("retrieval_status") or "",
+        "queue_bucket": record.get("queue_bucket") or "",
+        "review_reason": record.get("review_reason") or "",
+        "index_source": record.get("index_source") or "",
+        "total_pages": int(record.get("total_pages") or 0),
+        "indexed_pages": int(record.get("indexed_pages") or 0),
+        "pending_pages": int(record.get("pending_pages") or 0),
+        "batch_enqueued_at": record.get("batch_enqueued_at") or "",
+        "updated_at": record.get("updated_at") or "",
+        "is_terminal": is_terminal_pdf_status(record),
+        "index_entries": len(saved_index),
+        "index_source_breakdown": source_counts,
+        "latest_run_label": latest_event.get("run_label") or "",
+        "latest_run_total_seconds": round(latest_total, 3),
+        "timing_event_count": len(timing_events),
+        "logged_total_seconds": total_logged,
+        "timings": timing_events,
+    }
+
+
+def write_batch_report(batch_run_id: str) -> Optional[Path]:
+    batch_run_id = str(batch_run_id or "").strip()
+    if not batch_run_id:
+        return None
+    records = [record for record in list_pdf_records() if str(record.get("batch_run_id") or "") == batch_run_id]
+    if not records:
+        return None
+    records.sort(key=lambda item: (str(item.get("batch_enqueued_at") or ""), str(item.get("updated_at") or ""), str(item.get("filename") or "")))
+    pdf_entries = [build_batch_pdf_entry(record) for record in records]
+    started_candidates = [entry.get("batch_enqueued_at") for entry in pdf_entries if entry.get("batch_enqueued_at")]
+    completed_candidates = [entry.get("updated_at") for entry in pdf_entries if entry.get("updated_at") and entry.get("is_terminal")]
+    summary = {
+        "total_pdfs": len(pdf_entries),
+        "completed_pdfs": sum(1 for entry in pdf_entries if entry.get("is_terminal")),
+        "review_pdfs": sum(1 for entry in pdf_entries if entry.get("review_reason")),
+        "failed_pdfs": sum(1 for entry in pdf_entries if str(entry.get("status") or "").lower() == "failed"),
+        "vectorized_pdfs": sum(1 for entry in pdf_entries if str(entry.get("retrieval_status") or "").lower() == "vectorized"),
+        "finalized_pdfs": sum(1 for entry in pdf_entries if str(entry.get("status") or "").lower() in {"vectorized", "index_ready", "needs_review"}),
+        "total_logged_seconds": round(sum(float(entry.get("logged_total_seconds") or 0.0) for entry in pdf_entries), 3),
+    }
+    payload = {
+        "batch_run_id": batch_run_id,
+        "generated_at": utc_now_iso(),
+        "started_at": min(started_candidates) if started_candidates else "",
+        "last_completed_at": max(completed_candidates) if completed_candidates else "",
+        "status": "completed" if summary["completed_pdfs"] == summary["total_pdfs"] else "running",
+        "summary": summary,
+        "pdfs": pdf_entries,
+    }
+    report_path = batch_report_path(batch_run_id)
+    report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report_path
+
+
+def update_batch_report_for_pdf(pdf_id: str):
+    record = get_pdf_record(pdf_id)
+    if not record:
+        return
+    batch_run_id = str(record.get("batch_run_id") or "").strip()
+    if batch_run_id:
+        try:
+            write_batch_report(batch_run_id)
+        except Exception:
+            log.exception("Failed to update batch report for %s", pdf_id)
+
+
+def list_batch_reports(limit: int = 12) -> list[dict]:
+    reports = []
+    report_dir = Path(BATCH_REPORT_PATH)
+    if not report_dir.exists():
+        return reports
+    for report_file in sorted(report_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:limit]:
+        try:
+            payload = json.loads(report_file.read_text(encoding="utf-8"))
+        except Exception:
+            log.exception("Failed to read batch report %s", report_file)
+            continue
+        reports.append({
+            "batch_run_id": payload.get("batch_run_id") or report_file.stem,
+            "generated_at": payload.get("generated_at") or "",
+            "started_at": payload.get("started_at") or "",
+            "last_completed_at": payload.get("last_completed_at") or "",
+            "status": payload.get("status") or "unknown",
+            "summary": payload.get("summary") or {},
+            "path": str(report_file),
+        })
+    return reports
+
 # ── ChromaDB ──────────────────────────────────────────────────────────────────
 Path(CHROMA_DB_PATH).mkdir(parents=True, exist_ok=True)
 Path(PDF_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 Path(INDEX_EXPORT_PATH).mkdir(parents=True, exist_ok=True)
 Path(TIMING_LOG_PATH).mkdir(parents=True, exist_ok=True)
+Path(BATCH_REPORT_PATH).mkdir(parents=True, exist_ok=True)
 chroma_client = chromadb.PersistentClient(
     path=CHROMA_DB_PATH,
     settings=Settings(anonymized_telemetry=False),
@@ -1414,9 +1546,14 @@ def toc_acceptance_floor(quality: dict, candidate_pages: list[dict]) -> bool:
         for page in candidate_pages
     )
 
+    if explicit_pages >= 1:
+        if kept >= 3 and ascending >= 0.90 and coverage >= 0.75:
+            return True
+        if kept >= 2 and strong_explicit and ascending >= 1.0 and coverage >= 0.55:
+            return True
+        return False
+
     if kept >= 3 and ascending >= 0.66 and coverage >= 0.5:
-        return True
-    if kept >= 2 and explicit_pages >= 1 and ascending >= 1.0 and strong_explicit:
         return True
     return False
 
@@ -1446,10 +1583,27 @@ def should_force_image_toc_retry(candidate_pages: list[dict], result: dict, toc_
         not rule_quality
         or not rule_quality.get("accepted")
         or int(rule_quality.get("kept_items") or 0) < 3
-        or float(rule_quality.get("coverage_ratio") or 0.0) < 0.75
+        or float(rule_quality.get("coverage_ratio") or 0.0) < 0.80
     )
     sparse_lines = candidate_line_count <= 14
-    return explicit_signal and scanned_or_noisy and not strong_rule and (weak_rule or sparse_lines)
+    return explicit_signal and (scanned_or_noisy or sparse_lines) and not strong_rule and weak_rule
+
+
+def build_strict_index_review_reasons(total_pages: int, explicit_toc_detected: bool, toc_items: list[dict], final_items: list[dict]) -> list[str]:
+    non_gap_items = [item for item in final_items if str(item.get("source") or "").strip() != "gap"]
+    auto_items = [item for item in non_gap_items if str(item.get("source") or "").strip() == "auto"]
+    reasons = []
+
+    if explicit_toc_detected and not toc_items:
+        reasons.append("explicit_toc_detected_but_not_extracted")
+    if explicit_toc_detected and auto_items:
+        reasons.append("toc_detected_but_final_index_used_ai_fallback")
+    if total_pages >= 6 and len(non_gap_items) <= 1 and auto_items:
+        reasons.append("single_ai_section_for_multi_page_pdf")
+    if explicit_toc_detected and total_pages >= 6 and len(non_gap_items) <= 1:
+        reasons.append("too_few_sections_for_visible_toc")
+
+    return list(dict.fromkeys(reasons))
 
 
 def rank_toc_candidate_pages(candidate_pages: list[dict], toc_markers: list[str]) -> list[dict]:
@@ -2441,6 +2595,7 @@ def build_existing_pdf_payload(pdf_id: str, filename_override: str = "") -> Opti
 
 def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, end_page: Optional[int] = None) -> dict:
     pdf_id = pdf_id_from_bytes(pdf_bytes)
+    existing_record = get_pdf_record(pdf_id) or {}
     pdf_path = stored_pdf_path(pdf_id)
     pdf_path.write_bytes(pdf_bytes)
     log.info("Full-document ingest for PDF: %s  id=%s", filename, pdf_id)
@@ -2477,6 +2632,8 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
         deferred_decision="completed",
         last_error="",
         review_reason="",
+        batch_run_id=existing_record.get("batch_run_id", ""),
+        batch_enqueued_at=existing_record.get("batch_enqueued_at", ""),
     )
 
     with timing_collector.stage("full text extraction", "full_text_extraction_time"):
@@ -2524,8 +2681,11 @@ def run_stage_one_ingest(pdf_bytes: bytes, filename: str, start_page: int = 1, e
         deferred_decision="completed",
         last_error="",
         review_reason="",
+        batch_run_id=existing_record.get("batch_run_id", ""),
+        batch_enqueued_at=existing_record.get("batch_enqueued_at", ""),
     )
 
+    update_batch_report_for_pdf(pdf_id)
     timing_collector.log_summary("full_document_ingest")
 
     return {
@@ -2588,7 +2748,14 @@ def build_stage_one_payload(pdf_bytes: bytes, filename: str, start_page: int = 1
     return asyncio.run(build_stage_one_payload_async(pdf_bytes, filename, start_page=start_page, end_page=end_page))
 
 
-def enqueue_pdf_for_stage1(pdf_bytes: bytes, filename: str, start_page: int = 1, end_page: Optional[int] = None) -> dict:
+def enqueue_pdf_for_stage1(
+    pdf_bytes: bytes,
+    filename: str,
+    start_page: int = 1,
+    end_page: Optional[int] = None,
+    batch_run_id: str = "",
+    batch_enqueued_at: str = "",
+) -> dict:
     pdf_id = pdf_id_from_bytes(pdf_bytes)
     existing = build_existing_pdf_payload(pdf_id, filename)
     if existing:
@@ -2630,7 +2797,10 @@ def enqueue_pdf_for_stage1(pdf_bytes: bytes, filename: str, start_page: int = 1,
         deferred_decision="queue",
         last_error="",
         review_reason="",
+        batch_run_id=batch_run_id,
+        batch_enqueued_at=batch_enqueued_at,
     )
+    update_batch_report_for_pdf(pdf_id)
     return {
         "pdf_id": pdf_id,
         "filename": filename,
@@ -2641,6 +2811,7 @@ def enqueue_pdf_for_stage1(pdf_bytes: bytes, filename: str, start_page: int = 1,
         "pending_pages": total_pages,
         "queued": True,
         "skipped_duplicate": False,
+        "batch_run_id": batch_run_id,
     }
 
 
@@ -2841,6 +3012,7 @@ def start_stage1_batch_runner_if_needed() -> bool:
 def analyze_saved_index_health(index_items: list[dict], total_pages: int) -> dict:
     gap_items = [item for item in index_items if item.get("source") == "gap"]
     non_gap_items = [item for item in index_items if item.get("source") != "gap"]
+    auto_items = [item for item in non_gap_items if str(item.get("source") or "").strip() == "auto"]
     gap_pages = sum(
         max(0, coerce_page_number(item.get("pageTo"), 0) - coerce_page_number(item.get("pageFrom"), 0) + 1)
         for item in gap_items
@@ -2862,6 +3034,8 @@ def analyze_saved_index_health(index_items: list[dict], total_pages: int) -> dic
         reasons.append("gap_dominates_document")
     if total_pages >= 30 and largest_gap / max(total_pages, 1) >= 0.75:
         reasons.append("very_large_gap")
+    if total_pages >= 6 and len(non_gap_items) <= 1 and auto_items:
+        reasons.append("single_ai_section_for_multi_page_pdf")
 
     return {
         "suspicious": bool(reasons),
@@ -2948,6 +3122,10 @@ INDEX_REVIEW_REASON_LABELS = {
     "single_section_with_near_total_gap": "Only one named section was found and the rest is a large gap",
     "gap_dominates_document": "Most of the index is covered by generic gaps",
     "very_large_gap": "The index contains an unusually large gap range",
+    "explicit_toc_detected_but_not_extracted": "A visible TOC/index page was detected but usable TOC rows were not extracted",
+    "toc_detected_but_final_index_used_ai_fallback": "A visible TOC/index page was detected but AI fallback was used in the final index",
+    "single_ai_section_for_multi_page_pdf": "Only one broad AI section was created for a multi-page PDF",
+    "too_few_sections_for_visible_toc": "Too few final sections were created despite a visible TOC/index page",
 }
 
 
@@ -3611,6 +3789,7 @@ Return only valid JSON:
     toc_rule_items = []
     toc_image_items = []
     toc_text_items = []
+    explicit_toc_detected = False
 
     with timing_collector.stage("TOC detection", "toc_detection"):
         toc_started = time.perf_counter()
@@ -3639,6 +3818,7 @@ Return only valid JSON:
                 for item in all_candidate_pages
             ],
         )
+        explicit_toc_detected = any(item.get("explicit") for item in all_candidate_pages)
 
         selected_pages = select_toc_pages_for_extraction(all_candidate_pages, max_pages=3)
         fallback_selected_pages = select_toc_pages_for_extraction(ranked_fallback, max_pages=3)
@@ -3696,8 +3876,10 @@ Return only valid JSON:
 
         scan_chunk = 25
         auto_items = []
-        uncovered_pages = all_pages if not index_items else []
-        if not index_items:
+        uncovered_pages = all_pages if (not index_items and not explicit_toc_detected) else []
+        if not index_items and explicit_toc_detected:
+            log.warning("Visible TOC detected for %s but no reliable TOC rows were extracted. Routing to review instead of trusting AI fallback.", req.pdf_id)
+        elif not index_items:
             log.info("No TOC found. Scanning %s indexed pages for document boundaries", len(uncovered_pages))
 
         for i in range(0, len(uncovered_pages), scan_chunk):
@@ -3805,19 +3987,24 @@ Return ONLY a valid JSON array (empty [] if nothing found):
             })
 
         classified_final = classify_index_to_parent_documents(final, all_pages)
-        index_source = toc_source or ("toc" if index_items else "auto")
+        strict_review_reasons = build_strict_index_review_reasons(total_pages, explicit_toc_detected, index_items, classified_final)
+        review_reason = format_review_reason(strict_review_reasons)
+        index_source = toc_source or ("toc" if index_items else ("review_required" if explicit_toc_detected else "auto"))
 
     with timing_collector.stage("JSON generation", "json_generation_time"):
         save_index(req.pdf_id, classified_final)
 
         if record:
+            pending_after = int(record.get("pending_pages", 0) or 0)
+            needs_review = bool(review_reason) and pending_after == 0
             update_pdf_record(
                 req.pdf_id,
-                status="index_ready",
+                status="needs_review" if needs_review else "index_ready",
                 index_ready=True,
                 index_source=index_source,
-                queue_bucket="deferred" if record.get("pending_pages", 0) > 0 else "library",
-                deferred_decision="pending" if record.get("pending_pages", 0) > 0 else "completed",
+                queue_bucket="reindex_review" if needs_review else ("deferred" if pending_after > 0 else "library"),
+                deferred_decision="pending" if pending_after > 0 else "completed",
+                review_reason=review_reason if needs_review else "",
             )
             record = get_pdf_record(req.pdf_id)
 
@@ -3833,6 +4020,7 @@ Return ONLY a valid JSON array (empty [] if nothing found):
 
     timing_collector.log_summary("index_generation")
 
+    update_batch_report_for_pdf(req.pdf_id)
     return {
         "index": classified_final,
         "total_pages": total_pages,
@@ -3846,6 +4034,7 @@ Return ONLY a valid JSON array (empty [] if nothing found):
         "retrieval_status": record["retrieval_status"] if record else "legacy",
         "pending_pages": record["pending_pages"] if record else max(total_pages - total_chunks, 0),
         "chat_ready": record["chat_ready"] if record else True,
+        "review_reason": (record or {}).get("review_reason", ""),
         "index_export_file": str(export_path),
     }
 
@@ -3858,26 +4047,30 @@ async def generate_index(req: IndexRequest):
     if record:
         pending_pages = int(record.get("pending_pages", 0) or 0)
         is_fully_vectorized = pending_pages == 0 and (str(record.get("retrieval_status") or "").lower() == "vectorized" or bool(record.get("chat_ready")))
+        review_reason = payload.get("review_reason", "")
+        needs_review = bool(review_reason) and pending_pages == 0
         update_pdf_record(
             req.pdf_id,
-            status="index_ready" if pending_pages > 0 else ("vectorized" if is_fully_vectorized else "index_ready"),
+            status="index_ready" if pending_pages > 0 else ("needs_review" if needs_review else ("vectorized" if is_fully_vectorized else "index_ready")),
             index_ready=True,
             index_source=payload.get("index_source", record.get("index_source", "auto")),
             indexed_pages=payload.get("indexed_pages", record.get("indexed_pages", 0)),
             selected_start_page=payload.get("indexed_page_start", record.get("selected_start_page", 1)),
             selected_end_page=payload.get("indexed_page_end", record.get("selected_end_page", 1)),
-            queue_bucket="deferred" if pending_pages > 0 else "library",
+            queue_bucket="deferred" if pending_pages > 0 else ("reindex_review" if needs_review else "library"),
             deferred_decision="pending" if pending_pages > 0 else "completed",
-            review_reason="" if pending_pages == 0 else record.get("review_reason", ""),
+            review_reason=review_reason if needs_review else ("" if pending_pages == 0 else record.get("review_reason", "")),
         )
         updated_record = get_pdf_record(req.pdf_id) or record
-        if pending_pages == 0:
+        if pending_pages == 0 and not needs_review:
             audit_saved_index_record(req.pdf_id, record=updated_record)
             updated_record = get_pdf_record(req.pdf_id) or updated_record
         payload["status"] = updated_record.get("status", payload.get("status", "index_ready"))
         payload["retrieval_status"] = updated_record.get("retrieval_status", payload.get("retrieval_status", "legacy"))
         payload["pending_pages"] = updated_record.get("pending_pages", payload.get("pending_pages", 0))
         payload["chat_ready"] = bool(updated_record.get("chat_ready", payload.get("chat_ready", True)))
+        payload["review_reason"] = updated_record.get("review_reason", payload.get("review_reason", ""))
+    update_batch_report_for_pdf(req.pdf_id)
     return payload
 
 # -- 4. GET PAGE TEXT ──────────────────────────────────────────────────────────
@@ -3927,6 +4120,8 @@ async def enqueue_stage1_batch(
 ):
     results = []
     seen_pdf_ids: set[str] = set()
+    batch_run_id = create_batch_run_id()
+    batch_enqueued_at = utc_now_iso()
     for file in files:
         if not file.filename.lower().endswith(".pdf"):
             results.append({"filename": file.filename, "status": "skipped", "reason": "Only PDF files are accepted"})
@@ -3943,14 +4138,24 @@ async def enqueue_stage1_batch(
             })
             continue
         seen_pdf_ids.add(pdf_id)
-        results.append(enqueue_pdf_for_stage1(pdf_bytes, file.filename, start_page=start_page, end_page=end_page))
+        results.append(enqueue_pdf_for_stage1(
+            pdf_bytes,
+            file.filename,
+            start_page=start_page,
+            end_page=end_page,
+            batch_run_id=batch_run_id,
+            batch_enqueued_at=batch_enqueued_at,
+        ))
 
+    report_path = write_batch_report(batch_run_id)
     started_runner = start_stage1_batch_runner_if_needed()
     return {
         "pdfs": results,
         "count": len(results),
         "started_runner": started_runner,
         "runner": dict(stage1_batch_runner_status),
+        "batch_run_id": batch_run_id,
+        "batch_report_file": str(report_path) if report_path else "",
     }
 
 
@@ -4122,6 +4327,25 @@ async def get_pdf_timings(pdf_id: str):
         "filename": record.get("filename") or f"{pdf_id}.pdf",
         "events": get_pdf_timing_history(pdf_id),
     }
+
+
+@app.get("/api/batch-reports")
+async def get_batch_reports(limit: int = 12):
+    safe_limit = max(1, min(int(limit or 12), 50))
+    return {
+        "reports": list_batch_reports(safe_limit),
+    }
+
+
+@app.get("/api/batch-reports/{batch_run_id}")
+async def get_batch_report(batch_run_id: str):
+    report_path = batch_report_path(batch_run_id)
+    if not report_path.exists():
+        raise HTTPException(404, f"Batch report {batch_run_id} not found")
+    try:
+        return json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(500, f"Could not read batch report: {exc}")
 
 
 @app.get("/api/pdfs/{pdf_id}")
