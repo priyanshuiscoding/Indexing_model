@@ -454,7 +454,7 @@ function QueueStatusModal({
   setAuditRowEnd,
   pdfSearch,
   batchFilter,
-  batchReports,
+  batchReports = [],
 }) {
   if (!open) return null;
 
@@ -573,7 +573,7 @@ function QueueStatusModal({
             <span className="runner-state idle">Recent Batch Reports</span>
             <span className="runner-meta">Saved in backend for overnight comparison</span>
           </div>
-          {batchReports.length ? (
+          {(Array.isArray(batchReports) && batchReports.length) ? (
             <div className="batch-report-list">
               {batchReports.map((report) => {
                 const summary = report.summary || {};
