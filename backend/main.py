@@ -84,6 +84,7 @@ LOCAL_LLM_TIMEOUT = float(os.getenv("LOCAL_LLM_TIMEOUT", "180"))
 CHROMA_DB_PATH   = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 PDF_STORAGE_PATH = os.getenv("PDF_STORAGE_PATH", "./stored_pdfs")
 INDEX_EXPORT_PATH = os.getenv("INDEX_EXPORT_PATH", "./index_exports")
+INDEX_DEBUG_PATH = os.getenv("INDEX_DEBUG_PATH", str(Path(INDEX_EXPORT_PATH) / "debug"))
 TIMING_LOG_PATH = os.getenv("TIMING_LOG_PATH", "./timing_logs")
 BATCH_REPORT_PATH = os.getenv("BATCH_REPORT_PATH", "./batch_reports")
 TESSERACT_LANG   = os.getenv("TESSERACT_LANG", "hin+eng")
@@ -137,14 +138,13 @@ LOW_CONFIDENCE_TOC_SOURCES = {"toc", "toc-image"}
 TOC_TABLE_HEADER_PATTERNS = [
     r"\bs\.?\s*no\b",
     r"\bserial\s*no\b",
-    r"\bdescription\b",
-    r"\bdocument\b",
     r"\bannexure\b",
     r"\bannx\b",
-    r"\bpages?\b",
     r"\bpage\s*no\b",
     r"\bsheets?\b",
-    r"\bparticulars?\b",
+    r"\bdescription of (?:the )?documents\b",
+    r"\bdescription of documents\b",
+    r"\bdescription of document\b",
 ]
 
 # Local LLM configuration
@@ -406,6 +406,7 @@ def list_batch_reports(limit: int = 12) -> list[dict]:
 Path(CHROMA_DB_PATH).mkdir(parents=True, exist_ok=True)
 Path(PDF_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 Path(INDEX_EXPORT_PATH).mkdir(parents=True, exist_ok=True)
+Path(INDEX_DEBUG_PATH).mkdir(parents=True, exist_ok=True)
 Path(TIMING_LOG_PATH).mkdir(parents=True, exist_ok=True)
 Path(BATCH_REPORT_PATH).mkdir(parents=True, exist_ok=True)
 chroma_client = chromadb.PersistentClient(
@@ -667,6 +668,27 @@ def export_index_json(
     export_path = Path(INDEX_EXPORT_PATH) / f"{sanitize_export_stem(export_stem)}.json"
     export_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return export_path
+
+
+def export_index_debug_json(pdf_id: str, record: Optional[dict], debug_payload: dict) -> Path:
+    cnr_number = (
+        (record or {}).get("cnr_number")
+        or cnr_number_from_filename((record or {}).get("filename", ""))
+        or pdf_id
+    )
+    case_meta = derive_case_metadata((record or {}).get("filename") or cnr_number)
+    export_stem = case_meta.get("case_no") or cnr_number or pdf_id
+    debug_path = Path(INDEX_DEBUG_PATH) / f"{sanitize_export_stem(export_stem)}.debug.json"
+    debug_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pdf_id": pdf_id,
+        "filename": (record or {}).get("filename", ""),
+        "cnr_number": cnr_number,
+        "generated_at": utc_now_iso(),
+        **(debug_payload or {}),
+    }
+    debug_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return debug_path
 
 
 def get_or_create_collection(pdf_id: str):
@@ -1509,6 +1531,35 @@ TOC_NEGATIVE_PAGE_PATTERNS = [
 ]
 
 
+def has_real_toc_table_signature(text: str, features: dict) -> bool:
+    lower = (text or "").lower()
+    has_description_docs = bool(re.search(r"\bdescription of (?:the )?documents\b", lower, flags=re.IGNORECASE))
+    has_annexure = bool(re.search(r"\bannexures?\b", lower, flags=re.IGNORECASE)) or features.get("header_hits", 0) >= 1
+    has_page_header = bool(re.search(r"\bpage\s*no\b", lower, flags=re.IGNORECASE)) or bool(re.search(r"\bpages?\b", lower, flags=re.IGNORECASE))
+    has_numbered_rows = features.get("numbered_row_lines", 0) >= 2 or features.get("short_row_like_lines", 0) >= 4
+    return has_description_docs and has_annexure and has_page_header and has_numbered_rows
+
+
+def has_strong_explicit_toc_signal(text: str, features: dict) -> bool:
+    lower = (text or "").lower()
+    return (
+        bool(re.search(r"\bindex\b", lower, flags=re.IGNORECASE))
+        or bool(re.search(r"table of contents", lower, flags=re.IGNORECASE))
+        or has_real_toc_table_signature(text, features)
+    )
+
+
+def has_weak_structural_toc_signal(text: str, features: dict) -> bool:
+    lower = (text or "").lower()
+    return (
+        has_strong_explicit_toc_signal(text, features)
+        or features.get("header_hits", 0) >= 2
+        or (features.get("header_hits", 0) >= 1 and features.get("numbered_row_lines", 0) >= 2)
+        or (features.get("page_range_hits", 0) >= 2 and features.get("short_row_like_lines", 0) >= 3)
+        or (features.get("row_like_lines", 0) >= 4 and "chronology" not in lower)
+    )
+
+
 def explicit_toc_page_score(text: str, features: dict) -> int:
     lower = (text or "").lower()
     score = score_toc_features(features)
@@ -1518,27 +1569,20 @@ def explicit_toc_page_score(text: str, features: dict) -> int:
     for pattern, penalty in TOC_NEGATIVE_PAGE_PATTERNS:
         if re.search(pattern, lower, flags=re.IGNORECASE):
             score -= penalty
-    if features.get("header_hits", 0) >= 2 and features.get("numbered_row_lines", 0) >= 2:
-        score += 40
-    if features.get("marker_hits", 0) >= 1 and features.get("header_hits", 0) >= 1:
-        score += 35
+    if has_real_toc_table_signature(text, features):
+        score += 60
+    elif has_strong_explicit_toc_signal(text, features):
+        score += 45
+    elif has_weak_structural_toc_signal(text, features):
+        score += 18
     return score
 
 
 def has_explicit_toc_signal(text: str, features: dict) -> bool:
-    lower = (text or "").lower()
-    return (
-        bool(re.search(r"\bindex\b", lower, flags=re.IGNORECASE))
-        or bool(re.search(r"table of contents", lower, flags=re.IGNORECASE))
-        or (
-            bool(re.search(r"\bdescription of (?:the )?documents\b", lower, flags=re.IGNORECASE))
-            and bool(re.search(r"\bannexures?\b", lower, flags=re.IGNORECASE))
-        )
-        or (features.get("header_hits", 0) >= 2 and features.get("numbered_row_lines", 0) >= 2)
-    )
+    return has_strong_explicit_toc_signal(text, features)
 
 
-def toc_acceptance_floor(quality: dict, candidate_pages: list[dict]) -> bool:
+def toc_acceptance_floor(quality: dict, candidate_pages: list[dict], allow_partial: bool = False) -> bool:
     kept = int(quality.get("kept_items") or 0)
     ascending = float(quality.get("ascending_ratio") or 0.0)
     coverage = float(quality.get("coverage_ratio") or 0.0)
@@ -1553,9 +1597,13 @@ def toc_acceptance_floor(quality: dict, candidate_pages: list[dict]) -> bool:
             return True
         if kept >= 2 and strong_explicit and ascending >= 1.0 and coverage >= 0.55:
             return True
+        if allow_partial and kept >= 2 and ascending >= 1.0 and coverage >= 0.40:
+            return True
         return False
 
     if kept >= 3 and ascending >= 0.66 and coverage >= 0.5:
+        return True
+    if allow_partial and kept >= 2 and ascending >= 1.0 and coverage >= 0.35:
         return True
     return False
 
@@ -1570,7 +1618,7 @@ def should_force_image_toc_retry(candidate_pages: list[dict], result: dict, toc_
     for page in candidate_pages:
         page_text = page.get("text", "")
         features = analyze_toc_page_features(page_text, toc_markers)
-        if has_explicit_toc_signal(page_text, features):
+        if has_strong_explicit_toc_signal(page_text, features):
             explicit_signal = True
             break
 
@@ -1591,19 +1639,21 @@ def should_force_image_toc_retry(candidate_pages: list[dict], result: dict, toc_
     return explicit_signal and (scanned_or_noisy or sparse_lines) and not strong_rule and weak_rule
 
 
-def build_strict_index_review_reasons(total_pages: int, explicit_toc_detected: bool, toc_items: list[dict], final_items: list[dict]) -> list[str]:
+def build_strict_index_review_reasons(total_pages: int, explicit_toc_detected: bool, toc_items: list[dict], final_items: list[dict], confidence: Optional[dict] = None) -> list[str]:
     non_gap_items = [item for item in final_items if str(item.get("source") or "").strip() != "gap"]
     auto_items = [item for item in non_gap_items if str(item.get("source") or "").strip() == "auto"]
     reasons = []
 
     if explicit_toc_detected and not toc_items:
         reasons.append("explicit_toc_detected_but_not_extracted")
-    if explicit_toc_detected and auto_items:
+    if explicit_toc_detected and auto_items and not toc_items:
         reasons.append("toc_detected_but_final_index_used_ai_fallback")
     if total_pages >= 6 and len(non_gap_items) <= 1 and auto_items:
         reasons.append("single_ai_section_for_multi_page_pdf")
     if explicit_toc_detected and total_pages >= 6 and len(non_gap_items) <= 1:
         reasons.append("too_few_sections_for_visible_toc")
+    if confidence and confidence.get("review_required"):
+        reasons.extend(confidence.get("reason_codes") or [])
 
     return list(dict.fromkeys(reasons))
 
@@ -1617,34 +1667,45 @@ def rank_toc_candidate_pages(candidate_pages: list[dict], toc_markers: list[str]
             "page": page,
             "score": explicit_toc_page_score(page_text, features),
             "features": features,
-            "explicit": has_explicit_toc_signal(page_text, features),
+            "explicit": has_strong_explicit_toc_signal(page_text, features),
+            "structural": has_weak_structural_toc_signal(page_text, features),
         })
-    ranked.sort(key=lambda item: (-item["score"], not item["explicit"], item["page"]["page_num"]))
+    ranked.sort(key=lambda item: (-item["score"], item["page"]["page_num"]))
     return ranked
 
 
-def select_toc_pages_for_extraction(ranked_pages: list[dict], max_pages: int = 3) -> list[dict]:
+def build_toc_anchor_bundle(anchor_item: dict, ranked_pages: list[dict], max_pages: int = 3) -> list[dict]:
+    page_map = {item["page"]["page_num"]: item["page"] for item in ranked_pages}
+    anchor_page_num = anchor_item["page"]["page_num"]
+    bundle_nums = [anchor_page_num]
+
+    prev_page_num = anchor_page_num - 1
+    while len(bundle_nums) < max_pages and prev_page_num in page_map:
+        bundle_nums.insert(0, prev_page_num)
+        prev_page_num -= 1
+
+    next_page_num = anchor_page_num + 1
+    while len(bundle_nums) < max_pages and next_page_num in page_map:
+        bundle_nums.append(next_page_num)
+        next_page_num += 1
+
+    return [page_map[num] for num in bundle_nums]
+
+
+def select_toc_page_bundles(ranked_pages: list[dict], max_anchors: int = 3, max_pages: int = 3) -> list[list[dict]]:
     if not ranked_pages:
         return []
 
-    ranked_by_priority = sorted(
-        ranked_pages,
-        key=lambda item: (-int(bool(item.get("explicit"))), -item["score"], item["page"]["page_num"])
-    )
-    best_anchor = ranked_by_priority[0]
-    anchor_page_num = best_anchor["page"]["page_num"]
-
-    contiguous = [best_anchor]
-    next_page_num = anchor_page_num + 1
-    while len(contiguous) < max_pages:
-        match = next((item for item in ranked_pages if item["page"]["page_num"] == next_page_num), None)
-        if not match:
-            break
-        contiguous.append(match)
-        next_page_num += 1
-
-    return [item["page"] for item in contiguous[:max_pages]]
-
+    bundles = []
+    seen = set()
+    for anchor in ranked_pages[:max_anchors]:
+        bundle = build_toc_anchor_bundle(anchor, ranked_pages, max_pages=max_pages)
+        page_nums = tuple(page["page_num"] for page in bundle)
+        if not page_nums or page_nums in seen:
+            continue
+        seen.add(page_nums)
+        bundles.append(bundle)
+    return bundles
 
 def is_toc_header_line(line: str, toc_markers: list[str]) -> bool:
     lower = (line or "").strip().lower()
@@ -3167,15 +3228,18 @@ def refresh_saved_index_if_needed(
     payload = generate_index_payload(IndexRequest(pdf_id=pdf_id))
     refreshed_record = get_pdf_record(pdf_id) or record
     total_pages = int(refreshed_record.get("total_pages") or payload.get("total_pages") or 0)
+    review_reason = str(payload.get("review_reason") or refreshed_record.get("review_reason") or "").strip()
+    needs_review = bool(review_reason)
     update_pdf_record(
         pdf_id,
-        status="vectorized",
+        status="needs_review" if needs_review else "vectorized",
         retrieval_status="vectorized",
         chat_ready=True,
         pending_pages=0,
-        queue_bucket="library",
+        queue_bucket="reindex_review" if needs_review else "library",
         deferred_decision="completed",
         last_error="",
+        review_reason=review_reason if needs_review else "",
         index_ready=True,
         index_source=payload.get("index_source", refreshed_record.get("index_source", "auto")),
         indexed_pages=max(int(payload.get("indexed_pages") or 0), total_pages),
@@ -3196,6 +3260,10 @@ INDEX_REVIEW_REASON_LABELS = {
     "toc_detected_but_final_index_used_ai_fallback": "A visible TOC/index page was detected but AI fallback was used in the final index",
     "single_ai_section_for_multi_page_pdf": "Only one broad AI section was created for a multi-page PDF",
     "too_few_sections_for_visible_toc": "Too few final sections were created despite a visible TOC/index page",
+    "non_monotonic_sections": "The final index has overlapping or non-monotonic sections",
+    "insufficient_named_sections": "Too few named sections were found for the document size",
+    "high_gap_coverage": "A large share of the document is still covered by generic gap ranges",
+    "large_unexplained_gap": "The index still contains a large unexplained uncovered range",
 }
 
 
@@ -3346,24 +3414,27 @@ def run_reindex_review_worker(pdf_ids: list[str]):
                 payload = generate_index_payload(IndexRequest(pdf_id=pdf_id))
                 refreshed = get_pdf_record(pdf_id) or record
                 total_pages = int(refreshed.get("total_pages") or payload.get("total_pages") or 0)
+                review_reason = str(payload.get("review_reason") or refreshed.get("review_reason") or "").strip()
+                needs_review = bool(review_reason)
                 update_pdf_record(
                     pdf_id,
-                    status="vectorized",
+                    status="needs_review" if needs_review else "vectorized",
                     retrieval_status="vectorized",
                     chat_ready=True,
                     pending_pages=0,
-                    queue_bucket="library",
+                    queue_bucket="reindex_review" if needs_review else "library",
                     deferred_decision="completed",
                     last_error="",
-                    review_reason="",
+                    review_reason=review_reason if needs_review else "",
                     index_ready=True,
                     index_source=payload.get("index_source", refreshed.get("index_source", "auto")),
                     indexed_pages=max(int(payload.get("indexed_pages") or 0), total_pages),
                     selected_start_page=1,
                     selected_end_page=total_pages or int(payload.get("indexed_page_end") or refreshed.get("selected_end_page") or 1),
                 )
-                fixed += 1
-                reindex_review_runner_status["fixed"] = fixed
+                if not needs_review:
+                    fixed += 1
+                    reindex_review_runner_status["fixed"] = fixed
             except Exception as exc:
                 log.exception("Reindex review queue failed for %s", pdf_id)
                 update_pdf_record(pdf_id, status="needs_review", queue_bucket="reindex_review", last_error=str(exc))
@@ -3678,6 +3749,58 @@ def generate_index_payload(req: IndexRequest, timing_collector: Optional[PdfTimi
     ]
     pdf_path = stored_pdf_path(req.pdf_id)
     toc_llm_calls = 0
+    debug_report = {
+        "total_pages": total_pages,
+        "indexed_page_start": indexed_start,
+        "indexed_page_end": indexed_end,
+        "toc": {
+            "candidate_pages": [],
+            "candidate_bundles": [],
+            "selected_bundle": [],
+            "selected_source": "",
+            "selected_mode": "none",
+            "selected_quality": {},
+            "rejected_titles": [],
+        },
+        "auto": {
+            "scanned_ranges": [],
+            "items_found": 0,
+        },
+        "final": {},
+    }
+
+    def summarize_quality(quality: Optional[dict]) -> dict:
+        if not quality:
+            return {}
+        return {
+            "accepted": bool(quality.get("accepted")),
+            "partial_accepted": bool(quality.get("partial_accepted")),
+            "kept_items": int(quality.get("kept_items") or 0),
+            "total_items": int(quality.get("total_items") or 0),
+            "coverage_ratio": round(float(quality.get("coverage_ratio") or 0.0), 4),
+            "ascending_ratio": round(float(quality.get("ascending_ratio") or 0.0), 4),
+            "has_meaningful_page_span": bool(quality.get("has_meaningful_page_span")),
+            "rejected_titles": list(quality.get("rejected_titles") or []),
+        }
+
+    def choose_best_toc_quality(quality_by_source: dict, candidate_pages: list[dict]) -> dict:
+        best = {"source": "", "quality": None, "accepted": False, "partial": False, "score": -1.0}
+        for source_name, quality in (quality_by_source or {}).items():
+            if not quality:
+                continue
+            accepted = bool(quality.get("accepted")) and toc_acceptance_floor(quality, candidate_pages, allow_partial=False)
+            partial = bool(quality.get("partial_accepted")) and toc_acceptance_floor(quality, candidate_pages, allow_partial=True)
+            score = (
+                (300 if accepted else 0)
+                + (180 if (partial and not accepted) else 0)
+                + (int(quality.get("kept_items") or 0) * 20)
+                + (float(quality.get("ascending_ratio") or 0.0) * 60)
+                + (float(quality.get("coverage_ratio") or 0.0) * 40)
+                + (12 if quality.get("has_meaningful_page_span") else 0)
+            )
+            if score > best["score"]:
+                best = {"source": source_name, "quality": quality, "accepted": accepted, "partial": partial and not accepted, "score": score}
+        return best
 
     def read_direct_toc_text_map(candidate_pages: list[dict]) -> dict[int, str]:
         direct_map = {page["page_num"]: "" for page in candidate_pages}
@@ -3707,22 +3830,28 @@ def generate_index_payload(req: IndexRequest, timing_collector: Optional[PdfTimi
         nonlocal toc_llm_calls
         result = {
             "page_nums": [],
+            "filtered_lines": [],
             "rule_items": [],
             "text_items": [],
             "image_items": [],
+            "qualities": {},
             "accepted_items": [],
             "accepted_source": "",
+            "partial_items": [],
+            "partial_source": "",
+            "selected_quality": {},
             "candidate_line_count": 0,
             "ocr_pages": [],
             "skipped_pages": [],
             "force_image_retry": False,
+            "candidate_score": 0.0,
+            "rejected_titles": [],
         }
         if not candidate_pages:
             return result
 
         direct_text_map = read_direct_toc_text_map(candidate_pages)
         filtered_lines: list[str] = []
-
         for page in candidate_pages:
             page_num = page["page_num"]
             direct_text = direct_text_map.get(page_num, "")
@@ -3748,35 +3877,24 @@ def generate_index_payload(req: IndexRequest, timing_collector: Optional[PdfTimi
             deduped_lines.append(line)
             seen_lines.add(key)
         filtered_lines = deduped_lines
+        result["filtered_lines"] = filtered_lines
         result["candidate_line_count"] = len(filtered_lines)
 
         log.info("TOC OCR pages for %s: used=%s skipped=%s", req.pdf_id, result["ocr_pages"], result["skipped_pages"])
         log.info("TOC candidate line count for %s: %s", req.pdf_id, result["candidate_line_count"])
         debug_dump("TOC filtered lines", "\n".join(filtered_lines))
 
-        rule_quality = None
         result["rule_items"] = parse_rule_based_toc_items(filtered_lines, default_source="toc")
         if result["rule_items"]:
-            log.info("Rule-based TOC parsing found %s rows from pages %s", len(result["rule_items"]), result["page_nums"])
-            rule_quality = evaluate_toc_items_confidence(result["rule_items"], toc_range_end)
-            log.info(
-                "TOC rule quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s",
-                req.pdf_id,
-                rule_quality["kept_items"],
-                rule_quality["total_items"],
-                rule_quality["coverage_ratio"],
-                rule_quality["ascending_ratio"],
-                rule_quality["rejected_titles"],
-            )
-            if rule_quality["accepted"] and toc_acceptance_floor(rule_quality, candidate_pages):
-                result["accepted_items"] = rule_quality["items"]
-                result["accepted_source"] = "toc"
+            result["qualities"]["rule"] = evaluate_toc_items_confidence(result["rule_items"], toc_range_end)
+            quality = result["qualities"]["rule"]
+            log.info("TOC rule quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s", req.pdf_id, quality["kept_items"], quality["total_items"], quality["coverage_ratio"], quality["ascending_ratio"], quality["rejected_titles"])
 
-        result["force_image_retry"] = should_force_image_toc_retry(candidate_pages, result, toc_markers, rule_quality)
+        result["force_image_retry"] = should_force_image_toc_retry(candidate_pages, result, toc_markers, result["qualities"].get("rule"))
         if result["force_image_retry"]:
             log.info("Forcing TOC image retry for %s on pages %s after weak/noisy scanned TOC parse", req.pdf_id, result["page_nums"])
 
-        if allow_text_llm and not result["accepted_items"] and filtered_lines and not result["force_image_retry"]:
+        if allow_text_llm and filtered_lines and not result["force_image_retry"]:
             toc_prompt = f"""You are reading filtered TOC candidate lines from an Indian court document.
 These lines may come from a real Table of Contents / Index spanning multiple pages.
 
@@ -3806,60 +3924,47 @@ Return only valid JSON:
 ]"""
             debug_dump("TOC raw prompt", toc_prompt)
             toc_llm_calls += 1
-            toc_raw = call_local_text(
-                messages=[{"role": "user", "content": toc_prompt}],
-                max_tokens=2200,
-            )
+            toc_raw = call_local_text(messages=[{"role": "user", "content": toc_prompt}], max_tokens=2200)
             debug_dump("TOC raw response", toc_raw)
             result["text_items"] = extract_json_list(toc_raw)
             for row in result["text_items"]:
                 row.setdefault("source", "toc")
             if result["text_items"]:
-                log.info("Merged TOC LLM call found %s rows from pages %s", len(result["text_items"]), result["page_nums"])
-                text_quality = evaluate_toc_items_confidence(result["text_items"], toc_range_end)
-                log.info(
-                    "TOC text quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s",
-                    req.pdf_id,
-                    text_quality["kept_items"],
-                    text_quality["total_items"],
-                    text_quality["coverage_ratio"],
-                    text_quality["ascending_ratio"],
-                    text_quality["rejected_titles"],
-                )
-                if text_quality["accepted"] and toc_acceptance_floor(text_quality, candidate_pages):
-                    result["accepted_items"] = text_quality["items"]
-                    result["accepted_source"] = "toc"
-            elif toc_raw.strip():
-                log.info("TOC text response for pages %s was not usable JSON (%s chars)", result["page_nums"], len(toc_raw))
+                result["qualities"]["text"] = evaluate_toc_items_confidence(result["text_items"], toc_range_end)
+                quality = result["qualities"]["text"]
+                log.info("TOC text quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s", req.pdf_id, quality["kept_items"], quality["total_items"], quality["coverage_ratio"], quality["ascending_ratio"], quality["rejected_titles"])
 
-        if not result["accepted_items"] and allow_image_fallback:
+        if allow_image_fallback:
             result["image_items"] = extract_toc_from_page_images(pdf_path, result["page_nums"])
             if result["image_items"]:
-                log.info("TOC image fallback found %s rows from pages %s", len(result["image_items"]), result["page_nums"])
-                image_quality = evaluate_toc_items_confidence(result["image_items"], toc_range_end)
-                log.info(
-                    "TOC image quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s",
-                    req.pdf_id,
-                    image_quality["kept_items"],
-                    image_quality["total_items"],
-                    image_quality["coverage_ratio"],
-                    image_quality["ascending_ratio"],
-                    image_quality["rejected_titles"],
-                )
-                if image_quality["accepted"] and toc_acceptance_floor(image_quality, candidate_pages):
-                    result["accepted_items"] = image_quality["items"]
-                    result["accepted_source"] = "toc-image"
+                result["qualities"]["image"] = evaluate_toc_items_confidence(result["image_items"], toc_range_end)
+                quality = result["qualities"]["image"]
+                log.info("TOC image quality for %s: kept=%s/%s coverage=%.2f ascending=%.2f rejected=%s", req.pdf_id, quality["kept_items"], quality["total_items"], quality["coverage_ratio"], quality["ascending_ratio"], quality["rejected_titles"])
 
+        best_quality = choose_best_toc_quality(result["qualities"], candidate_pages)
+        result["selected_quality"] = {**summarize_quality(best_quality.get("quality")), "source": best_quality.get("source", "")}
+        result["candidate_score"] = float(best_quality.get("score") or 0.0)
+        if best_quality.get("quality"):
+            result["rejected_titles"] = list(best_quality["quality"].get("rejected_titles") or [])
+            chosen_items = list(best_quality["quality"].get("items") or [])
+            resolved_source = "toc-image" if best_quality.get("source") == "image" else "toc"
+            if best_quality.get("accepted"):
+                result["accepted_items"] = chosen_items
+                result["accepted_source"] = resolved_source
+            elif best_quality.get("partial"):
+                result["partial_items"] = chosen_items
+                result["partial_source"] = resolved_source
         return result
 
     index_items = []
     toc_source = ""
-    toc_range_end = total_pages if record else indexed_end
     toc_page_nums = []
     toc_rule_items = []
     toc_image_items = []
     toc_text_items = []
     explicit_toc_detected = False
+    structural_toc_detected = False
+    toc_mode = "none"
 
     with timing_collector.stage("TOC detection", "toc_detection"):
         toc_started = time.perf_counter()
@@ -3876,81 +3981,86 @@ Return only valid JSON:
                     continue
                 seen_candidate_pages.add(page_num)
                 all_candidate_pages.append(item)
-        log.info(
-            "TOC candidate pages for %s: %s",
-            req.pdf_id,
-            [
-                {
-                    "page": item["page"]["page_num"],
-                    "score": item["score"],
-                    "explicit": item.get("explicit", False),
-                }
-                for item in all_candidate_pages
-            ],
-        )
         explicit_toc_detected = any(item.get("explicit") for item in all_candidate_pages)
+        structural_toc_detected = any(item.get("structural") for item in all_candidate_pages)
+        debug_report["toc"]["candidate_pages"] = [{"page": item["page"]["page_num"], "score": item["score"], "explicit": bool(item.get("explicit")), "structural": bool(item.get("structural")), "features": item.get("features", {})} for item in all_candidate_pages]
+        log.info("TOC candidate pages for %s: %s", req.pdf_id, [{"page": item["page"]["page_num"], "score": item["score"], "explicit": item.get("explicit", False), "structural": item.get("structural", False)} for item in all_candidate_pages])
 
-        selected_pages = select_toc_pages_for_extraction(all_candidate_pages, max_pages=3)
-        fallback_selected_pages = select_toc_pages_for_extraction(ranked_fallback, max_pages=3)
-        fallback_page_nums = [page["page_num"] for page in fallback_selected_pages]
-        log.info("TOC selected pages for %s: primary=%s fallback=%s", req.pdf_id, [page["page_num"] for page in selected_pages], fallback_page_nums)
+        candidate_bundles = select_toc_page_bundles(all_candidate_pages, max_anchors=3, max_pages=3)
+        if not candidate_bundles:
+            candidate_bundles = select_toc_page_bundles(ranked_fallback, max_anchors=3, max_pages=3)
 
-        first_text_pages = selected_pages or fallback_selected_pages
-        first_pass = run_toc_extraction(first_text_pages, allow_image_fallback=False, allow_text_llm=True)
-        toc_page_nums = first_pass["page_nums"]
-        toc_rule_items = first_pass["rule_items"]
-        toc_text_items = first_pass["text_items"]
-        toc_image_items = first_pass["image_items"]
-        combined_toc_items = first_pass["accepted_items"]
-        toc_source = first_pass["accepted_source"]
-        candidate_line_count = first_pass["candidate_line_count"]
-        force_image_retry = bool(first_pass.get("force_image_retry"))
+        bundle_runs = []
+        for bundle in candidate_bundles:
+            first_pass = run_toc_extraction(bundle, allow_image_fallback=False, allow_text_llm=True)
+            best_pass = first_pass
+            image_pass = None
+            if first_pass.get("force_image_retry") or (not first_pass.get("accepted_items") and not first_pass.get("partial_items")):
+                image_pass = run_toc_extraction(bundle, allow_image_fallback=True, allow_text_llm=False)
+                if float(image_pass.get("candidate_score") or 0.0) >= float(first_pass.get("candidate_score") or 0.0):
+                    best_pass = image_pass
+            bundle_debug = {
+                "pages": [page["page_num"] for page in bundle],
+                "first_pass": {"candidate_score": float(first_pass.get("candidate_score") or 0.0), "selected_quality": first_pass.get("selected_quality") or {}, "candidate_line_count": int(first_pass.get("candidate_line_count") or 0), "rejected_titles": list(first_pass.get("rejected_titles") or [])},
+                "image_pass": ({"candidate_score": float(image_pass.get("candidate_score") or 0.0), "selected_quality": image_pass.get("selected_quality") or {}, "candidate_line_count": int(image_pass.get("candidate_line_count") or 0), "rejected_titles": list(image_pass.get("rejected_titles") or [])} if image_pass else None),
+                "selected": False,
+            }
+            debug_report["toc"]["candidate_bundles"].append(bundle_debug)
+            bundle_runs.append({"best_pass": best_pass, "debug": bundle_debug})
 
-        image_fallback_pages = []
-        if fallback_selected_pages and fallback_page_nums != toc_page_nums:
-            image_fallback_pages = fallback_selected_pages
-        elif selected_pages:
-            image_fallback_pages = selected_pages
+        chosen_bundle = max(bundle_runs, key=lambda item: float((item.get("best_pass") or {}).get("candidate_score") or 0.0), default=None)
+        if chosen_bundle:
+            chosen_bundle["debug"]["selected"] = True
+            chosen = chosen_bundle["best_pass"]
+            toc_page_nums = chosen.get("page_nums") or []
+            toc_rule_items = chosen.get("rule_items") or []
+            toc_text_items = chosen.get("text_items") or []
+            toc_image_items = chosen.get("image_items") or []
+            debug_report["toc"]["selected_bundle"] = toc_page_nums
+            debug_report["toc"]["selected_quality"] = chosen.get("selected_quality") or {}
+            debug_report["toc"]["rejected_titles"] = list(chosen.get("rejected_titles") or [])
+            chosen_items = []
+            if chosen.get("accepted_items"):
+                chosen_items = chosen["accepted_items"]
+                toc_source = chosen.get("accepted_source") or "toc"
+                toc_mode = "accepted"
+            elif chosen.get("partial_items"):
+                chosen_items = chosen["partial_items"]
+                toc_source = chosen.get("partial_source") or "toc"
+                toc_mode = "partial"
+            if chosen_items:
+                index_items = build_toc_ranges_from_items(chosen_items, indexed_start, toc_range_end, "toc", toc_page_nums=toc_page_nums)
+                log.info("TOC merged across pages %s into %s unique rows (mode=%s)", toc_page_nums, len(index_items), toc_mode)
+                debug_dump("TOC final rows", index_items)
 
-        if force_image_retry:
-            image_fallback_pages = first_text_pages or image_fallback_pages
-
-        if (not combined_toc_items or force_image_retry) and image_fallback_pages:
-            log.info("Retrying TOC extraction with image fallback pages for %s: %s", req.pdf_id, [page["page_num"] for page in image_fallback_pages])
-            image_pass = run_toc_extraction(image_fallback_pages, allow_image_fallback=True, allow_text_llm=False)
-            toc_page_nums = image_pass["page_nums"]
-            toc_rule_items = image_pass["rule_items"]
-            toc_text_items = image_pass["text_items"]
-            toc_image_items = image_pass["image_items"]
-            if image_pass["accepted_items"]:
-                combined_toc_items = image_pass["accepted_items"]
-            toc_source = image_pass["accepted_source"] or toc_source
-            candidate_line_count = image_pass["candidate_line_count"]
-
-        if combined_toc_items:
-            index_items = build_toc_ranges_from_items(combined_toc_items, indexed_start, toc_range_end, "toc", toc_page_nums=toc_page_nums)
-            toc_source = toc_source or ("toc-image" if toc_image_items and not (toc_rule_items or toc_text_items) else "toc")
-            log.info("TOC merged across pages %s into %s unique rows", toc_page_nums, len(index_items))
-            debug_dump("TOC final rows", index_items)
-
+        debug_report["toc"]["selected_source"] = toc_source
+        debug_report["toc"]["selected_mode"] = toc_mode
         toc_elapsed = time.perf_counter() - toc_started
-        log.info(
-            "TOC detection stats for %s: candidate_line_count=%s toc_llm_calls=%s toc_detection_time=%.3fs",
-            req.pdf_id,
-            candidate_line_count,
-            toc_llm_calls,
-            toc_elapsed,
-        )
+        log.info("TOC detection stats for %s: toc_llm_calls=%s toc_detection_time=%.3fs", req.pdf_id, toc_llm_calls, toc_elapsed)
 
     with timing_collector.stage("LLM indexing", "llm_indexing_time"):
-
         scan_chunk = 25
         auto_items = []
-        uncovered_pages = all_pages if (not index_items and not explicit_toc_detected) else []
-        if not index_items and explicit_toc_detected:
-            log.warning("Visible TOC detected for %s but no reliable TOC rows were extracted. Routing to review instead of trusting AI fallback.", req.pdf_id)
-        elif not index_items:
-            log.info("No TOC found. Scanning %s indexed pages for document boundaries", len(uncovered_pages))
+        uncovered_pages = []
+        if not index_items:
+            uncovered_pages = list(all_pages)
+            if explicit_toc_detected or structural_toc_detected:
+                log.warning("TOC candidates for %s were weak. Falling back to whole-document boundary detection instead of hard review.", req.pdf_id)
+            else:
+                log.info("No TOC found. Scanning %s indexed pages for document boundaries", len(uncovered_pages))
+        else:
+            for page in all_pages:
+                covered = False
+                for item in index_items:
+                    pf = coerce_page_number(item.get("pageFrom"), 0)
+                    pt = coerce_page_number(item.get("pageTo"), pf)
+                    if pf <= page["page_num"] <= pt:
+                        covered = True
+                        break
+                if not covered:
+                    uncovered_pages.append(page)
+            if uncovered_pages:
+                log.info("Partial/accepted TOC retained for %s. Scanning %s uncovered pages for boundaries.", req.pdf_id, len(uncovered_pages))
 
         for i in range(0, len(uncovered_pages), scan_chunk):
             chunk_pages = uncovered_pages[i:i + scan_chunk]
@@ -3964,6 +4074,7 @@ Return only valid JSON:
 
             from_page = chunk_pages[0]["page_num"]
             to_page = chunk_pages[-1]["page_num"]
+            debug_report["auto"]["scanned_ranges"].append({"from": from_page, "to": to_page})
 
             scan_prompt = f"""You are analyzing pages from an Indian court document.
 Below is extracted text from pages {from_page} to {to_page}.
@@ -3986,10 +4097,7 @@ Return ONLY a valid JSON array (empty [] if nothing found):
   }}
 ]"""
 
-            raw = call_local_text(
-                messages=[{"role": "user", "content": scan_prompt}],
-                max_tokens=2000,
-            )
+            raw = call_local_text(messages=[{"role": "user", "content": scan_prompt}], max_tokens=2000)
             parsed = safe_json(raw)
             if isinstance(parsed, list):
                 for item in parsed:
@@ -4001,6 +4109,7 @@ Return ONLY a valid JSON array (empty [] if nothing found):
                             "source": "auto",
                         })
 
+        debug_report["auto"]["items_found"] = len(auto_items)
         all_items = index_items + auto_items
         all_items.sort(key=lambda item: item.get("pageFrom", 0))
 
@@ -4057,9 +4166,70 @@ Return ONLY a valid JSON array (empty [] if nothing found):
             })
 
         classified_final = classify_index_to_parent_documents(final, all_pages)
-        strict_review_reasons = build_strict_index_review_reasons(total_pages, explicit_toc_detected, index_items, classified_final)
+        gap_items = [item for item in classified_final if item.get("source") == "gap"]
+        non_gap_items = [item for item in classified_final if item.get("source") != "gap"]
+        named_items = [item for item in non_gap_items if not str(item.get("title") or "").startswith("Pages ")]
+        gap_pages = sum(max(0, coerce_page_number(item.get("pageTo"), 0) - coerce_page_number(item.get("pageFrom"), 0) + 1) for item in gap_items)
+        largest_gap = max((max(0, coerce_page_number(item.get("pageTo"), 0) - coerce_page_number(item.get("pageFrom"), 0) + 1) for item in gap_items), default=0)
+        gap_ratio = gap_pages / max(total_pages, 1)
+        largest_gap_ratio = largest_gap / max(total_pages, 1)
+        monotonic = True
+        prev_to = 0
+        for item in sorted(classified_final, key=lambda row: (coerce_page_number(row.get("pageFrom"), 0), coerce_page_number(row.get("pageTo"), 0))):
+            pf = coerce_page_number(item.get("pageFrom"), 0)
+            pt = coerce_page_number(item.get("pageTo"), pf)
+            if pf < prev_to:
+                monotonic = False
+                break
+            prev_to = max(prev_to, pt)
+
+        confidence_score = 100.0
+        confidence_reason_codes = []
+        if not monotonic:
+            confidence_score -= 30
+            confidence_reason_codes.append("non_monotonic_sections")
+        if total_pages >= 6 and len(named_items) <= 1:
+            confidence_score -= 28
+            confidence_reason_codes.append("insufficient_named_sections")
+        if gap_ratio >= 0.75:
+            confidence_score -= 26
+            confidence_reason_codes.append("high_gap_coverage")
+        elif gap_ratio >= 0.50:
+            confidence_score -= 16
+            confidence_reason_codes.append("high_gap_coverage")
+        if largest_gap_ratio >= 0.40:
+            confidence_score -= 14
+            confidence_reason_codes.append("large_unexplained_gap")
+        confidence_score = max(0.0, min(100.0, confidence_score))
+        confidence = {
+            "score": round(confidence_score, 2),
+            "review_required": confidence_score < 65 or "non_monotonic_sections" in confidence_reason_codes or ("insufficient_named_sections" in confidence_reason_codes and total_pages >= 10),
+            "reason_codes": list(dict.fromkeys(confidence_reason_codes)),
+            "gap_ratio": round(gap_ratio, 4),
+            "largest_gap_ratio": round(largest_gap_ratio, 4),
+            "named_sections": len(named_items),
+            "non_gap_sections": len(non_gap_items),
+            "gap_sections": len(gap_items),
+            "monotonic": monotonic,
+        }
+
+        strict_review_reasons = build_strict_index_review_reasons(total_pages, explicit_toc_detected, index_items, classified_final, confidence=confidence)
         review_reason = format_review_reason(strict_review_reasons)
-        index_source = toc_source or ("toc" if index_items else ("review_required" if explicit_toc_detected else "auto"))
+        if index_items and auto_items:
+            index_source = "hybrid"
+        elif index_items:
+            index_source = toc_source or "toc"
+        else:
+            index_source = "auto"
+        debug_report["final"] = {
+            "index_source": index_source,
+            "review_reason": review_reason,
+            "review_reason_codes": strict_review_reasons,
+            "confidence": confidence,
+            "toc_items": len(index_items),
+            "auto_items": len(auto_items),
+            "final_sections": len(classified_final),
+        }
 
     with timing_collector.stage("JSON generation", "json_generation_time"):
         save_index(req.pdf_id, classified_final)
@@ -4078,15 +4248,8 @@ Return ONLY a valid JSON array (empty [] if nothing found):
             )
             record = get_pdf_record(req.pdf_id)
 
-        export_path = export_index_json(
-            pdf_id=req.pdf_id,
-            record=record,
-            index_items=classified_final,
-            indexed_start=indexed_start,
-            indexed_end=indexed_end,
-            total_pages=total_pages,
-            index_source=index_source,
-        )
+        export_path = export_index_json(pdf_id=req.pdf_id, record=record, index_items=classified_final, indexed_start=indexed_start, indexed_end=indexed_end, total_pages=total_pages, index_source=index_source)
+        debug_path = export_index_debug_json(req.pdf_id, record, debug_report)
 
     timing_collector.log_summary("index_generation")
 
@@ -4106,8 +4269,9 @@ Return ONLY a valid JSON array (empty [] if nothing found):
         "chat_ready": record["chat_ready"] if record else True,
         "review_reason": (record or {}).get("review_reason", ""),
         "index_export_file": str(export_path),
+        "index_debug_file": str(debug_path),
+        "index_confidence": debug_report["final"].get("confidence", {}),
     }
-
 
 
 @app.post("/api/generate-index")
@@ -4979,3 +5143,10 @@ async def startup():
     if resumed_deferred:
         log.info("Resumed deferred queue on startup")
     log.info("Server ready")
+
+
+
+
+
+
+
