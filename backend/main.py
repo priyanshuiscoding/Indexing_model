@@ -89,11 +89,16 @@ PARENT_DOCUMENT_NAMES = list(dict.fromkeys(
 ))
 PARENT_DOCUMENT_EMBEDDINGS = None
 GENERIC_PARENT_NAMES = {"other", "others"}
+DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+USING_DEFAULT_NVIDIA_ENDPOINT = NVIDIA_BASE_URL.rstrip("/") == DEFAULT_NVIDIA_BASE_URL
+# Local OpenAI-compatible endpoints (for example Qwen/vLLM) can run without an API key.
+MODEL_API_READY = bool(NVIDIA_API_KEY) or not USING_DEFAULT_NVIDIA_ENDPOINT
+MODEL_API_KEY_FOR_CLIENT = NVIDIA_API_KEY or ("local-no-key" if MODEL_API_READY else "")
 
 # ── NVIDIA client ──────────────────────────────────────────────────────────────
 nvidia_client = OpenAI(
     base_url=NVIDIA_BASE_URL,
-    api_key=NVIDIA_API_KEY,
+    api_key=MODEL_API_KEY_FOR_CLIENT,
 )
 
 # ── Embedding model (local, offline, Hindi+English) ───────────────────────────
@@ -259,7 +264,7 @@ def should_try_handwritten_assist(direct_text: str, ocr_text: str) -> bool:
 
 def extract_handwritten_page_text(image: Image.Image, page_num: int) -> Optional[str]:
     """Use the vision model as a higher-accuracy fallback for handwritten Hindi/English pages."""
-    if not ENABLE_HANDWRITTEN_HINDI_ASSIST or not NVIDIA_API_KEY:
+    if not ENABLE_HANDWRITTEN_HINDI_ASSIST or not MODEL_API_READY:
         return None
 
     prompt = f"""You are transcribing a scanned Indian court-file page.
@@ -335,7 +340,7 @@ def extract_toc_from_page_images(pdf_path: Path, page_nums: list[int]) -> list[d
     Use page images for TOC extraction with improved structured table detection.
     Now focuses specifically on extracting table rows with Sr.No, Title, Page columns.
     """
-    if not page_nums or not pdf_path.exists() or not NVIDIA_API_KEY:
+    if not page_nums or not pdf_path.exists() or not MODEL_API_READY:
         return []
 
     toc_items = []
@@ -924,7 +929,7 @@ def health():
         "status": "ok",
         "models": {"vision": VISION_MODEL, "text": TEXT_MODEL},
         "embedding_ready": embedder is not None,
-        "handwritten_hindi_assist": ENABLE_HANDWRITTEN_HINDI_ASSIST and bool(NVIDIA_API_KEY),
+        "handwritten_hindi_assist": ENABLE_HANDWRITTEN_HINDI_ASSIST and MODEL_API_READY,
         "workflow_db": str(WORKFLOW_DB_PATH),
     }
 
@@ -1592,13 +1597,16 @@ async def nvidia_proxy(req: NvidiaProxyRequest):
     Proxy for NVIDIA API calls from the frontend.
     Adds the API key server-side so it never goes to the browser.
     """
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if NVIDIA_API_KEY:
+        headers["Authorization"] = f"Bearer {NVIDIA_API_KEY}"
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
             f"{NVIDIA_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {NVIDIA_API_KEY}",
-                "Content-Type":  "application/json",
-            },
+            headers=headers,
+
             json={
                 "model":       req.model,
                 "messages":    req.messages,
@@ -1615,10 +1623,11 @@ async def nvidia_proxy(req: NvidiaProxyRequest):
 @app.on_event("startup")
 async def startup():
     init_workflow_db()
-    if not NVIDIA_API_KEY:
-        log.warning("NVIDIA_API_KEY is not set — AI features will fail")
+    if not MODEL_API_READY:
+        log.warning("Model API credentials are not configured for the default NVIDIA endpoint - AI features will fail")
     log.info(f"Vision model : {VISION_MODEL}")
     log.info(f"Text model   : {TEXT_MODEL}")
     log.info(f"ChromaDB path: {CHROMA_DB_PATH}")
     log.info("Server ready")
+
 
