@@ -146,6 +146,48 @@ TOC_TABLE_HEADER_PATTERNS = [
     r"\bdescription of documents\b",
     r"\bdescription of document\b",
 ]
+TOC_METADATA_TITLE_PATTERNS = [
+    r"\bdate of filing\b",
+    r"\bdate of impugned\b",
+    r"\benrollment number\b",
+    r"\bname designation\b",
+    r"\bname of advocate\b",
+    r"\bsubject category\b",
+    r"\bsub code number\b",
+    r"\bsubject matter\b",
+    r"\bparticulars of the order under challenge\b",
+    r"\bparticulars of order under challenge\b",
+    r"\bprovision of law\b",
+    r"\bcase no\b",
+    r"\bdate\s*of\s*order\b",
+    r"\bpassed by\b",
+    r"\bpetitioner\b",
+    r"\brespondent\b",
+    r"\bplace\s*:\s*[a-z]+\b",
+    r"\bvaluation\b",
+    r"\badvocate\b",
+]
+TOC_DOCUMENT_TITLE_PATTERNS = [
+    r"\bcopy of\b",
+    r"\bannexure\b",
+    r"\baffidavit\b",
+    r"\bvakalat\b",
+    r"\breply\b",
+    r"\brejoinder\b",
+    r"\breplication\b",
+    r"\bwritten statement\b",
+    r"\bapplication\b",
+    r"\bimpugned order\b",
+    r"\blease deed\b",
+    r"\bnotice dated\b",
+    r"\bletter dated\b",
+    r"\blist of documents\b",
+    r"\bcivil revision\b",
+    r"\bpaper book\b",
+    r"\bbrief synopsis\b",
+    r"\blist of dates\b",
+    r"\bmemo of parties\b",
+]
 
 # Local LLM configuration
 
@@ -1805,6 +1847,20 @@ def clean_toc_title(title: str) -> str:
     return cleaned
 
 
+def is_toc_metadata_title(title: str) -> bool:
+    normalized = clean_toc_title(title).lower()
+    if not normalized:
+        return False
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in TOC_METADATA_TITLE_PATTERNS)
+
+
+def is_toc_document_title(title: str) -> bool:
+    normalized = clean_toc_title(title).lower()
+    if not normalized:
+        return False
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in TOC_DOCUMENT_TITLE_PATTERNS)
+
+
 def normalize_toc_parse_line(raw_line: str) -> str:
     line = normalize_page_digits(re.sub(r"\s+", " ", raw_line or "")).strip()
     line = line.replace("|", " ")
@@ -2024,12 +2080,15 @@ def evaluate_toc_items_confidence(items: list[dict], max_page_hint: int) -> dict
     rejected_titles = []
     previous_page = 0
     ascending_hits = 0
+    metadata_hits = 0
+    document_hits = 0
 
     for item in items:
         title = clean_toc_title(item.get("title", ""))
         lower = title.lower()
         page_from = coerce_page_number(item.get("pageFrom"), 0)
         page_to = coerce_page_number(item.get("pageTo"), page_from)
+        is_metadata = is_toc_metadata_title(title)
         is_noise = (
             len(title) < 4
             or len(title) > 180
@@ -2042,8 +2101,10 @@ def evaluate_toc_items_confidence(items: list[dict], max_page_hint: int) -> dict
             or page_from > max_page_hint
             or page_to > max_page_hint
         )
-        if is_noise:
+        if is_noise or is_metadata:
             rejected_titles.append(title)
+            if is_metadata:
+                metadata_hits += 1
             continue
 
         cleaned = {
@@ -2057,17 +2118,20 @@ def evaluate_toc_items_confidence(items: list[dict], max_page_hint: int) -> dict
         if cleaned["pageFrom"] >= previous_page:
             ascending_hits += 1
             previous_page = cleaned["pageFrom"]
+        if is_toc_document_title(title):
+            document_hits += 1
         cleaned_items.append(cleaned)
 
     total_items = len(items)
     kept_items = len(cleaned_items)
     ascending_ratio = ascending_hits / max(kept_items, 1)
     coverage_ratio = kept_items / max(total_items, 1)
+    metadata_ratio = metadata_hits / max(total_items, 1)
     has_meaningful_page_span = any(
         item["pageTo"] > item["pageFrom"] or item["pageFrom"] >= 2
         for item in cleaned_items
     )
-    accepted = (
+    structurally_accepted = (
         kept_items >= 3
         and coverage_ratio >= 0.6
         and ascending_ratio >= 0.66
@@ -2080,13 +2144,31 @@ def evaluate_toc_items_confidence(items: list[dict], max_page_hint: int) -> dict
         and ascending_ratio >= 1.0
         and has_meaningful_page_span
     )
+    semantic_accept = (
+        document_hits >= 2
+        or (document_hits >= 1 and has_meaningful_page_span and kept_items >= 3)
+        or (kept_items >= 3 and metadata_hits == 0)
+    )
+    partial_accepted = (
+        kept_items >= 2
+        and ascending_ratio >= 1.0
+        and has_meaningful_page_span
+        and document_hits >= 1
+        and metadata_ratio < 0.35
+    )
+    accepted = structurally_accepted and semantic_accept and metadata_ratio < 0.45
     return {
         "accepted": accepted,
+        "partial_accepted": partial_accepted and not accepted,
         "items": cleaned_items,
         "kept_items": kept_items,
         "total_items": total_items,
         "coverage_ratio": coverage_ratio,
         "ascending_ratio": ascending_ratio,
+        "has_meaningful_page_span": has_meaningful_page_span,
+        "metadata_hits": metadata_hits,
+        "metadata_ratio": metadata_ratio,
+        "document_hits": document_hits,
         "rejected_titles": rejected_titles[:8],
     }
 
@@ -3952,9 +4034,11 @@ def generate_index_payload(req: IndexRequest, timing_collector: Optional[PdfTimi
                 (300 if accepted else 0)
                 + (180 if (partial and not accepted) else 0)
                 + (int(quality.get("kept_items") or 0) * 20)
+                + (int(quality.get("document_hits") or 0) * 16)
                 + (float(quality.get("ascending_ratio") or 0.0) * 60)
                 + (float(quality.get("coverage_ratio") or 0.0) * 40)
                 + (12 if quality.get("has_meaningful_page_span") else 0)
+                - (float(quality.get("metadata_ratio") or 0.0) * 140)
             )
             if score > best["score"]:
                 best = {"source": source_name, "quality": quality, "accepted": accepted, "partial": partial and not accepted, "score": score}
