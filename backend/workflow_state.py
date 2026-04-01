@@ -105,18 +105,71 @@ def _init_sqlite_db():
 
 
 def _init_postgres_db():
-    schema_sql = POSTGRES_SCHEMA_PATH.read_text(encoding="utf-8")
+    fallback_schema = """
+    CREATE TABLE IF NOT EXISTS pdf_records (
+        pdf_id TEXT PRIMARY KEY,
+        filename TEXT NOT NULL,
+        total_pages INTEGER NOT NULL,
+        selected_start_page INTEGER NOT NULL,
+        selected_end_page INTEGER NOT NULL,
+        indexed_pages INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        retrieval_status TEXT NOT NULL,
+        index_ready BOOLEAN NOT NULL DEFAULT FALSE,
+        chat_ready BOOLEAN NOT NULL DEFAULT FALSE,
+        pending_pages INTEGER NOT NULL DEFAULT 0,
+        index_source TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS extracted_pages (
+        pdf_id TEXT NOT NULL,
+        page_num INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        used_ocr BOOLEAN NOT NULL DEFAULT FALSE,
+        vision_used BOOLEAN NOT NULL DEFAULT FALSE,
+        handwriting_suspected BOOLEAN NOT NULL DEFAULT FALSE,
+        extraction_method TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (pdf_id, page_num)
+    );
+
+    CREATE TABLE IF NOT EXISTS saved_indexes (
+        pdf_id TEXT PRIMARY KEY,
+        index_json JSONB NOT NULL,
+        total_entries INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """
+
+    schema_sql = fallback_schema
+    if POSTGRES_SCHEMA_PATH.exists():
+        try:
+            schema_sql = POSTGRES_SCHEMA_PATH.read_text(encoding="utf-8")
+        except Exception:
+            pass
+
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(schema_sql)
+
+            # Keep Postgres schema fully aligned with SQLite branch
+            cur.execute("ALTER TABLE pdf_records ADD COLUMN IF NOT EXISTS cnr_number TEXT NOT NULL DEFAULT ''")
+            cur.execute("ALTER TABLE pdf_records ADD COLUMN IF NOT EXISTS file_size_bytes BIGINT NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE pdf_records ADD COLUMN IF NOT EXISTS queue_bucket TEXT NOT NULL DEFAULT 'index'")
+            cur.execute("ALTER TABLE pdf_records ADD COLUMN IF NOT EXISTS deferred_decision TEXT NOT NULL DEFAULT 'pending'")
+            cur.execute("ALTER TABLE pdf_records ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT ''")
             cur.execute("ALTER TABLE pdf_records ADD COLUMN IF NOT EXISTS review_reason TEXT NOT NULL DEFAULT ''")
             cur.execute("ALTER TABLE pdf_records ADD COLUMN IF NOT EXISTS batch_run_id TEXT NOT NULL DEFAULT ''")
             cur.execute("ALTER TABLE pdf_records ADD COLUMN IF NOT EXISTS batch_enqueued_at TEXT NOT NULL DEFAULT ''")
         conn.commit()
     finally:
         conn.close()
-
 
 def init_db():
     if _is_postgres():
